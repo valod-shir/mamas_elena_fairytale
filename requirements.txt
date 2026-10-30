@@ -1,1 +1,5 @@
+aiogram==3.13.0
+aiohttp
+edge-tts
+python-dotenv
 

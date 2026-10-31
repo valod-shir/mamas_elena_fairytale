@@ -21,6 +21,12 @@ dp = Dispatcher()
 
 VOICE = "ru-RU-SvetlanaNeural"
 
+GEMINI_MODELS = [
+    "gemini-2.0-flash",
+    "gemini-1.5-flash-latest",
+    "gemini-pro"
+]
+
 class StoryForm(StatesGroup):
     waiting_for_details = State()
 
@@ -46,10 +52,7 @@ async def generate_story(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
-    # Запрос к официальному бесплатному API Google Gemini
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY.strip()}"
     headers = {"Content-Type": "application/json"}
-    
     prompt = (
         "Ты детский писатель-сказкотерапевт. Напиши добрую, нежную и короткую терапевтическую сказку "
         "для малыша на русском языке на основе пожелания: "
@@ -63,25 +66,28 @@ async def generate_story(message: types.Message, state: FSMContext):
             {
                 "parts": [{"text": prompt}]
             }
-        ],
-        "generationConfig": {
-            "temperature": 0.7
-        }
+        ]
     }
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=payload) as resp:
-                data = await resp.json()
-                if "candidates" in data and len(data["candidates"]) > 0:
-                    story_text = data["candidates"][0]["content"]["parts"][0]["text"]
-                else:
-                    err_msg = str(data.get("error", data))
-                    await status_msg.edit_text(f"Ответ Gemini: {err_msg[:300]}")
-                    await state.clear()
-                    return
-    except Exception as e:
-        await status_msg.edit_text(f"Ошибка запроса: {e}")
+    story_text = None
+    last_err = ""
+
+    async with aiohttp.ClientSession() as session:
+        for model in GEMINI_MODELS:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY.strip()}"
+            try:
+                async with session.post(url, headers=headers, json=payload) as resp:
+                    data = await resp.json()
+                    if "candidates" in data and len(data["candidates"]) > 0:
+                        story_text = data["candidates"][0]["content"]["parts"][0]["text"]
+                        break
+                    else:
+                        last_err = str(data.get("error", data))
+            except Exception as e:
+                last_err = str(e)
+
+    if not story_text:
+        await status_msg.edit_text(f"Ответ Gemini: {last_err[:300]}")
         await state.clear()
         return
 

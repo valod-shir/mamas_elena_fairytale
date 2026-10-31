@@ -64,7 +64,7 @@ async def generate_story(message: types.Message, state: FSMContext):
             },
             {"role": "user", "content": user_prompt}
         ],
-        "model": "deepseek/deepseek-chat:free",
+        "model": "meta-llama/llama-3.3-70b-instruct:free",
         "temperature": 0.7
     }
 

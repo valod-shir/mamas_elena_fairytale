@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import time
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -68,12 +69,12 @@ voice_keyboard = ReplyKeyboardMarkup(
 async def start_cmd(message: Message, state: FSMContext):
     await state.clear()
     welcome_text = (
-        "👋 **Добро пожаловать в мир добрых сказок!**\n\n"
+        "👋 Добро пожаловать в мир добрых сказок!\n\n"
         "Я помогу создать персональную терапевтическую аудиосказку для вашего малыша.\n\n"
-        "👶 **Шаг 1 из 4:** Напишите имя и возраст ребенка:\n"
-        "*(Например: Влада, полтора года)*"
+        "👶 Шаг 1 из 4: Напишите имя и возраст ребенка:\n"
+        "(Например: Влада, полтора года)"
     )
-    await message.answer(welcome_text, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+    await message.answer(welcome_text, reply_markup=ReplyKeyboardRemove())
     await state.set_state(StoryCreation.waiting_for_child_info)
 
 # 5. Шаг 1: Имя и возраст
@@ -81,18 +82,17 @@ async def start_cmd(message: Message, state: FSMContext):
 async def process_child_info(message: Message, state: FSMContext):
     await state.update_data(child_info=message.text.strip())
     await message.answer(
-        "🧸 **Шаг 2 из 4:** Кто любимый персонаж или игрушка малыша?\n"
-        "*(Например: котенок Мау, зайчик, машинка)*",
-        parse_mode="Markdown"
+        "🧸 Шаг 2 из 4: Кто любимый персонаж или игрушка малыша?\n"
+        "(Например: котенок Мау, зайчик, машинка)"
     )
     await state.set_state(StoryCreation.waiting_for_hero)
 
-# 6. Шаг 2: Персонаж
+# 6. Шаг 2: Герой
 @dp.message(StoryCreation.waiting_for_hero, F.text)
 async def process_hero(message: Message, state: FSMContext):
     await state.update_data(hero=message.text.strip())
     await message.answer(
-        "🎯 **Шаг 3 из 4:** Выберите тему сказки:",
+        "🎯 Шаг 3 из 4: Выберите тему сказки:",
         reply_markup=theme_keyboard
     )
     await state.set_state(StoryCreation.waiting_for_theme)
@@ -107,12 +107,12 @@ async def process_theme(message: Message, state: FSMContext):
 
     await state.update_data(theme=theme_text)
     await message.answer(
-        "🎙 **Шаг 4 из 4:** Каким голосом озвучить сказку?",
+        "🎙 Шаг 4 из 4: Каким голосом озвучить сказку?",
         reply_markup=voice_keyboard
     )
     await state.set_state(StoryCreation.waiting_for_voice)
 
-# Быстрая генерация сказки через актуальную модель gemini-3.8-flash
+# Устойчивая к ошибкам 503 генерация текста
 def generate_story_sync(child: str, hero: str, theme: str) -> str:
     if not ai_client:
         raise ValueError("GEMINI_API_KEY не задан")
@@ -120,26 +120,46 @@ def generate_story_sync(child: str, hero: str, theme: str) -> str:
     prompt = (
         f"Ты детский сказочник. Сочини короткую, нежную терапевтическую сказку на ночь.\n"
         f"Ребенок: {child}. Герой: {hero}. Тема: {theme}.\n"
-        f"Объем СТРОГО 70-90 слов. Простые предложения, чистый текст без спецсимволов markdown."
+        f"Объем СТРОГО 70-90 слов. Простые короткие предложения. "
+        f"Пиши чистым текстом БЕЗ спецсимволов (*, #, _), чтобы диктор читал ровно."
     )
 
-    response = ai_client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=prompt
-    )
-    return response.text.strip()
+    # Список моделей с приоритетом: быстрая -> стабильная резервная
+    models_to_try = [
+        "gemini-3.8-flash",
+        "gemini-3.8-flash", # вторая попытка
+        "gemini-2.5-pro",
+        "gemini-2.0-flash"
+    ]
 
-# Быстрая озвучка Edge-TTS с мужским и женским голосом
+    last_error = None
+    for model_name in models_to_try:
+        try:
+            response = ai_client.models.generate_content(
+                model=model_name,
+                contents=prompt
+            )
+            if response and response.text:
+                clean_text = response.text.replace("*", "").replace("#", "").strip()
+                return clean_text
+        except Exception as e:
+            last_error = e
+            logging.warning(f"Модель {model_name} вернула ошибку: {e}, пробую резерв...")
+            time.sleep(1.2)
+            continue
+
+    raise RuntimeError(f"Все модели перегружены: {last_error}")
+
+# Быстрая озвучка Edge-TTS с переключением на Дмитрий/Светлана
 async def generate_audio_fast(text: str, voice_str: str, file_path: str):
     is_male = ("Дмитрий" in voice_str or "папы" in voice_str)
     voice_name = "ru-RU-DmitryNeural" if is_male else "ru-RU-SvetlanaNeural"
 
     try:
         communicate = edge_tts.Communicate(text, voice_name)
-        # Ограничиваем ожидание Edge TTS максимум 12 секундами
         await asyncio.wait_for(communicate.save(file_path), timeout=12.0)
     except Exception as e:
-        logging.warning(f"Edge TTS не ответил ({e}), переключаюсь на gTTS...")
+        logging.warning(f"Edge TTS сбой ({e}), переключаюсь на gTTS...")
         def run_fallback():
             tts = gTTS(text=text, lang='ru', slow=False)
             tts.save(file_path)
@@ -160,16 +180,16 @@ async def process_voice_and_finish(message: Message, state: FSMContext):
     audio_path = f"story_{message.chat.id}_{message.message_id}.mp3"
 
     try:
-        # Шаг 1: Текст (2-4 секунды)
+        # Генерация текста
         story_text = await asyncio.to_thread(generate_story_sync, child, hero, theme)
-        await message.answer(f"📖 **Сказка для {child}**\n\n{story_text}", parse_mode="Markdown")
+        await message.answer(f"📖 Сказка для {child}\n\n{story_text}")
 
         try:
             await status_msg.edit_text("🎙 Записываю сказку голосом...")
         except Exception:
             pass
 
-        # Шаг 2: Аудио (3-6 секунд)
+        # Генерация аудио
         await generate_audio_fast(story_text, voice_choice, audio_path)
 
         voice_file = FSInputFile(audio_path)

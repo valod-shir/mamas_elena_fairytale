@@ -1,7 +1,6 @@
 import os
 import asyncio
 import logging
-import traceback
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -11,21 +10,23 @@ import edge_tts
 
 logging.basicConfig(level=logging.INFO)
 
-# 1. Считываем ключи (проверяем все возможные варианты названий)
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("BOT_TOKEN")
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+# Получение переменных окружения (с удалением случайных пробелов и кавычек)
+raw_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("BOT_TOKEN") or ""
+raw_gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
+
+BOT_TOKEN = raw_bot_token.strip().strip("'").strip('"')
+GEMINI_KEY = raw_gemini_key.strip().strip("'").strip('"')
 
 if not BOT_TOKEN:
-    logging.error("ОШИБКА: Токен бота не найден в Environment!")
+    logging.error("ВНИМАНИЕ: TELEGRAM_BOT_TOKEN не задан!")
 if not GEMINI_KEY:
-    logging.error("ОШИБКА: Ключ Gemini (GEMINI_API_KEY) не найден в Environment!")
+    logging.error("ВНИМАНИЕ: GEMINI_API_KEY не задан!")
 else:
     genai.configure(api_key=GEMINI_KEY)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# 2. Команда /start
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
     welcome_text = (
@@ -38,33 +39,51 @@ async def start_cmd(message: Message):
     )
     await message.answer(welcome_text)
 
-# Функция генерации текста через Gemini
-def get_gemini_story(user_prompt: str) -> str:
-    prompt = (
+def generate_story_with_fallback(prompt_text: str) -> str:
+    system_prompt = (
         "Ты добрый сказочник для малышей. Сочини короткую, терапевтическую, "
-        "успокаивающую сказку на ночь на основе следующего запроса:\n\n"
-        f"{user_prompt}\n\n"
-        "Требования: ласковый и понятный язык для ребенка, 130-180 слов, "
-        "строго без символов markdown-разметки (*, #, _), чтобы озвучка читала ровно."
+        "успокаивающую сказку на ночь на основе запроса пользователя. "
+        "Язык должен быть простым и ласковым, объем 130-180 слов. "
+        "Пиши чистым текстом БЕЗ спецсимволов markdown (*, #, _), чтобы озвучка читала плавно."
     )
-    # Используем стабильную быструю модель
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    res = model.generate_content(prompt)
-    return res.text.strip()
+    full_prompt = f"{system_prompt}\n\nЗапрос:\n{prompt_text}"
+    
+    # Список моделей для автоматического перебора при недоступности
+    candidate_models = [
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",
+        "gemini-pro"
+    ]
+    
+    last_err = None
+    for model_name in candidate_models:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(full_prompt)
+            if response and response.text:
+                return response.text.strip()
+        except Exception as err:
+            last_err = err
+            continue
+            
+    raise RuntimeError(f"Сбой всех моделей Gemini: {last_err}")
 
-# 3. Обработчик сообщений
 @dp.message(F.text)
-async def handle_text(message: Message):
+async def handle_user_text(message: Message):
     status_msg = await message.answer("✨ Сочиняю сказку...")
     audio_path = f"story_{message.chat.id}_{message.message_id}.mp3"
 
     try:
-        # Генерация сказки
-        story_text = await asyncio.to_thread(get_gemini_story, message.text)
+        if not GEMINI_KEY:
+            raise ValueError("Переменная GEMINI_API_KEY отсутствует в настройках Render Environment")
+
+        # 1. Генерация текста
+        story_text = await asyncio.to_thread(generate_story_with_fallback, message.text)
         await message.answer(story_text)
         await status_msg.edit_text("🎙 Записываю озвучку...")
 
-        # Генерация аудио
+        # 2. Озвучка через Edge TTS
         try:
             communicate = edge_tts.Communicate(story_text, "ru-RU-SvetlanaNeural")
             await communicate.save(audio_path)
@@ -78,16 +97,20 @@ async def handle_text(message: Message):
             await message.answer("Сказка готова текстом выше, но файл озвучки сохранить не удалось.")
         finally:
             if os.path.exists(audio_path):
-                os.remove(audio_path)
+                try:
+                    os.remove(audio_path)
+                except Exception:
+                    pass
 
     except Exception as e:
-        logging.error(f"Ошибка при работе Gemini: {e}")
-        traceback.print_exc()
-        await message.answer("Произошла ошибка при создании сказки. Попробуйте еще раз.")
+        error_details = str(e)
+        logging.error(f"Ошибка Gemini: {error_details}")
+        # Выводим точную техническую причину прямо пользователю для быстрой диагностики
+        await message.answer(f"⚠️ Ошибка генерации:\n{error_details[:300]}")
 
-# 4. Веб-сервер для прохождения проверки порта на Render
+# 3. Сервер для Render
 async def handle_ping(request):
-    return web.Response(text="Bot is alive")
+    return web.Response(text="Bot is running")
 
 async def start_server():
     app = web.Application()

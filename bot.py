@@ -69,12 +69,12 @@ voice_keyboard = ReplyKeyboardMarkup(
 async def start_cmd(message: Message, state: FSMContext):
     await state.clear()
     welcome_text = (
-        "👋 Добро пожаловать в мир добрых сказок!\n\n"
+        "👋 **Добро пожаловать в мир добрых сказок!**\n\n"
         "Я помогу создать персональную терапевтическую аудиосказку для вашего малыша.\n\n"
-        "👶 Шаг 1 из 4: Напишите имя и возраст ребенка:\n"
-        "(Например: Влада, полтора года)"
+        "👶 **Шаг 1 из 4:** Напишите имя и возраст ребенка:\n"
+        "*(Например: Влада, полтора года)*"
     )
-    await message.answer(welcome_text, reply_markup=ReplyKeyboardRemove())
+    await message.answer(welcome_text, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
     await state.set_state(StoryCreation.waiting_for_child_info)
 
 # 5. Шаг 1: Имя и возраст
@@ -82,17 +82,18 @@ async def start_cmd(message: Message, state: FSMContext):
 async def process_child_info(message: Message, state: FSMContext):
     await state.update_data(child_info=message.text.strip())
     await message.answer(
-        "🧸 Шаг 2 из 4: Кто любимый персонаж или игрушка малыша?\n"
-        "(Например: котенок Мау, зайчик, машинка)"
+        "🧸 **Шаг 2 из 4:** Кто любимый персонаж или игрушка малыша?\n"
+        "*(Например: котенок Мау, зайчик, машинка)*",
+        parse_mode="Markdown"
     )
     await state.set_state(StoryCreation.waiting_for_hero)
 
-# 6. Шаг 2: Герой
+# 6. Шаг 2: Персонаж
 @dp.message(StoryCreation.waiting_for_hero, F.text)
 async def process_hero(message: Message, state: FSMContext):
     await state.update_data(hero=message.text.strip())
     await message.answer(
-        "🎯 Шаг 3 из 4: Выберите тему сказки:",
+        "🎯 **Шаг 3 из 4:** Выберите тему сказки:",
         reply_markup=theme_keyboard
     )
     await state.set_state(StoryCreation.waiting_for_theme)
@@ -107,12 +108,12 @@ async def process_theme(message: Message, state: FSMContext):
 
     await state.update_data(theme=theme_text)
     await message.answer(
-        "🎙 Шаг 4 из 4: Каким голосом озвучить сказку?",
+        "🎙 **Шаг 4 из 4:** Каким голосом озвучить сказку?",
         reply_markup=voice_keyboard
     )
     await state.set_state(StoryCreation.waiting_for_voice)
 
-# Устойчивая к ошибкам 503 генерация текста
+# Надежная генерация с моделью gemini-3.8-flash и автоповтором при 503
 def generate_story_sync(child: str, hero: str, theme: str) -> str:
     if not ai_client:
         raise ValueError("GEMINI_API_KEY не задан")
@@ -124,33 +125,24 @@ def generate_story_sync(child: str, hero: str, theme: str) -> str:
         f"Пиши чистым текстом БЕЗ спецсимволов (*, #, _), чтобы диктор читал ровно."
     )
 
-    # Список моделей с приоритетом: быстрая -> стабильная резервная
-    models_to_try = [
-        "gemini-3.8-flash",
-        "gemini-3.8-flash", # вторая попытка
-        "gemini-2.5-pro",
-        "gemini-2.0-flash"
-    ]
-
     last_error = None
-    for model_name in models_to_try:
+    # Делаем до 4 попыток с паузой на случай временной пиковой нагрузки
+    for attempt in range(1, 5):
         try:
             response = ai_client.models.generate_content(
-                model=model_name,
+                model="gemini-3.8-flash",
                 contents=prompt
             )
             if response and response.text:
-                clean_text = response.text.replace("*", "").replace("#", "").strip()
-                return clean_text
+                return response.text.replace("*", "").replace("#", "").strip()
         except Exception as e:
             last_error = e
-            logging.warning(f"Модель {model_name} вернула ошибку: {e}, пробую резерв...")
-            time.sleep(1.2)
-            continue
+            logging.warning(f"Попытка {attempt} завершилась ошибкой: {e}. Ожидание...")
+            time.sleep(attempt * 1.5)  # 1.5с, затем 3.0с, затем 4.5с
 
-    raise RuntimeError(f"Все модели перегружены: {last_error}")
+    raise RuntimeError(f"Сервер Gemini перегружен: {last_error}")
 
-# Быстрая озвучка Edge-TTS с переключением на Дмитрий/Светлана
+# Озвучка Edge-TTS с переключением на Дмитрий / Светлана
 async def generate_audio_fast(text: str, voice_str: str, file_path: str):
     is_male = ("Дмитрий" in voice_str or "папы" in voice_str)
     voice_name = "ru-RU-DmitryNeural" if is_male else "ru-RU-SvetlanaNeural"

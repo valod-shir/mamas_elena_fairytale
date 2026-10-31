@@ -21,12 +21,6 @@ dp = Dispatcher()
 
 VOICE = "ru-RU-SvetlanaNeural"
 
-GEMINI_MODELS = [
-    "gemini-2.0-flash",
-    "gemini-1.5-flash-latest",
-    "gemini-pro"
-]
-
 class StoryForm(StatesGroup):
     waiting_for_details = State()
 
@@ -52,13 +46,14 @@ async def generate_story(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
+    key = GEMINI_API_KEY.strip()
     headers = {"Content-Type": "application/json"}
+    
     prompt = (
-        "Ты детский писатель-сказкотерапевт. Напиши добрую, нежную и короткую терапевтическую сказку "
-        "для малыша на русском языке на основе пожелания: "
-        f"{user_prompt}\n\n"
-        "Требования: объем около 150-200 слов. Используй только простой связный текст без звездочек (*), "
-        "решеток (#), кавычек и форматирования, так как текст пойдет прямо в аудио-озвучку."
+        "Ты детский писатель-сказкотерапевт. Напиши добрую, нежную и короткую сказку на ночь "
+        f"для малыша на русском языке на основе пожелания: {user_prompt}\n\n"
+        "Требования: объем около 150 слов. Пиши сплошным текстом без звездочек (*), "
+        "решеток (#), кавычек и спецсимволов, так как текст пойдет прямо в аудио-озвучку."
     )
 
     payload = {
@@ -70,24 +65,49 @@ async def generate_story(message: types.Message, state: FSMContext):
     }
 
     story_text = None
-    last_err = ""
+    debug_info = ""
 
     async with aiohttp.ClientSession() as session:
-        for model in GEMINI_MODELS:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY.strip()}"
-            try:
-                async with session.post(url, headers=headers, json=payload) as resp:
-                    data = await resp.json()
-                    if "candidates" in data and len(data["candidates"]) > 0:
-                        story_text = data["candidates"][0]["content"]["parts"][0]["text"]
-                        break
-                    else:
-                        last_err = str(data.get("error", data))
-            except Exception as e:
-                last_err = str(e)
+        # Шаг 1: Автоматически получаем список моделей, доступных именно этому ключу
+        list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}"
+        try:
+            async with session.get(list_url) as resp:
+                models_data = await resp.json()
+                if "models" in models_data:
+                    # Фильтруем модели, умеющие генерировать текст (generateContent)
+                    available_models = [
+                        m["name"] for m in models_data["models"] 
+                        if "generateContent" in m.get("supportedGenerationMethods", [])
+                    ]
+                else:
+                    available_models = []
+                    debug_info = f"Ошибка списка моделей: {models_data}"
+        except Exception as e:
+            available_models = []
+            debug_info = f"Ошибка сети при запросе моделей: {e}"
+
+        # Шаг 2: Пробуем найденные модели по очереди (приоритет отдаем flash)
+        if available_models:
+            # Сортируем так, чтобы flash-модели шли первыми
+            available_models.sort(key=lambda x: ("flash" not in x, x))
+            
+            for full_model_name in available_models:
+                gen_url = f"https://generativelanguage.googleapis.com/v1beta/{full_model_name}:generateContent?key={key}"
+                try:
+                    async with session.post(gen_url, headers=headers, json=payload) as resp:
+                        data = await resp.json()
+                        if "candidates" in data and len(data["candidates"]) > 0:
+                            story_text = data["candidates"][0]["content"]["parts"][0]["text"]
+                            break
+                        else:
+                            debug_info = f"Ошибка {full_model_name}: {str(data.get('error', data))[:120]}"
+                except Exception as e:
+                    debug_info = str(e)
+        elif not debug_info:
+            debug_info = "Google не вернул ни одной доступной модели для генерации текста."
 
     if not story_text:
-        await status_msg.edit_text(f"Ответ Gemini: {last_err[:300]}")
+        await status_msg.edit_text(f"Не удалось получить текст от Gemini:\n{debug_info[:300]}")
         await state.clear()
         return
 

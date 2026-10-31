@@ -15,7 +15,7 @@ from aiogram.types import (
     ReplyKeyboardRemove
 )
 from google import genai
-import edge_tts
+from gtts import gTTS
 
 logging.basicConfig(level=logging.INFO)
 
@@ -50,8 +50,8 @@ theme_keyboard = ReplyKeyboardMarkup(
 
 voice_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="👩 Голос мамы (Светлана)")],
-        [KeyboardButton(text="👨 Голос папы (Дмитрий)")]
+        [KeyboardButton(text="👩 Голос мамы (мягкий)")],
+        [KeyboardButton(text="👨 Голос папы (спокойный)")]
     ],
     resize_keyboard=True,
     one_time_keyboard=True
@@ -65,7 +65,7 @@ async def start_cmd(message: Message, state: FSMContext):
         "👋 Добро пожаловать в мир добрых сказок!\n\n"
         "Я помогу создать персональную терапевтическую аудиосказку для вашего малыша.\n\n"
         "👶 Шаг 1 из 4: Напишите имя и возраст ребенка.\n"
-        "(Например: Влада, полтора года)"
+        "(Например: Влада, 2 года)"
     )
     await message.answer(welcome_text, reply_markup=ReplyKeyboardRemove())
     await state.set_state(StoryCreation.waiting_for_child_info)
@@ -76,7 +76,7 @@ async def process_child_info(message: Message, state: FSMContext):
     await state.update_data(child_info=message.text.strip())
     await message.answer(
         "🧸 Шаг 2 из 4: Кто любимый герой, персонаж или игрушка малыша?\n"
-        "(Например: плюшевый котенок Мау, машинка Молния, зайчик)"
+        "(Например: зайчик, плюшевый котенок Мау, машинка)"
     )
     await state.set_state(StoryCreation.waiting_for_hero)
 
@@ -95,7 +95,7 @@ async def process_hero(message: Message, state: FSMContext):
 async def process_theme(message: Message, state: FSMContext):
     theme_text = message.text.strip()
     if theme_text == "✍️ Написать свою тему":
-        await message.answer("Напишите кратко, о чем должна быть сказка или какую привычку нужно привить:")
+        await message.answer("Напишите кратко, о чем должна быть сказка:")
         return
 
     await state.update_data(theme=theme_text)
@@ -105,48 +105,36 @@ async def process_theme(message: Message, state: FSMContext):
     )
     await state.set_state(StoryCreation.waiting_for_voice)
 
-# Надежная генерация с авто-перебором моделей и защитой от 503
+# Синхронная генерация текста через Gemini
 def generate_story_sync(child_info: str, hero: str, theme: str) -> str:
     system_instruction = (
         "Ты добрый сказочник для малышей. Сочини короткую, терапевтическую, "
         "успокаивающую сказку на ночь на основе запроса пользователя. "
-        "Язык должен быть простым и ласковым, объем 130-180 слов. "
+        "Язык должен быть простым и ласковым, объем 120-160 слов. "
         "Пиши чистым текстом БЕЗ спецсимволов markdown (*, #, _), чтобы озвучка читала ровно."
     )
     user_prompt = f"Ребенок: {child_info}\nЛюбимый герой: {hero}\nТема: {theme}"
     full_prompt = f"{system_instruction}\n\nЗапрос:\n{user_prompt}"
 
-    # Список актуальных быстрых моделей для подстраховки
-    fallback_models = [
-        "gemini-3.8-flash",
-        "gemini-2.0-flash",
-        "gemini-2.5-flash",
-        "gemini-1.5-flash"
-    ]
-
-    last_error = None
+    fallback_models = ["gemini-3.8-flash", "gemini-2.0-flash", "gemini-2.5-flash"]
     for model_name in fallback_models:
-        for attempt in range(2):  # 2 попытки на каждую модель
-            try:
-                response = ai_client.models.generate_content(
-                    model=model_name,
-                    contents=full_prompt
-                )
-                if response and response.text:
-                    return response.text.strip()
-            except Exception as err:
-                last_error = err
-                time.sleep(1.5)  # Пауза перед следующей попыткой
-                continue
+        try:
+            res = ai_client.models.generate_content(model=model_name, contents=full_prompt)
+            if res and res.text:
+                return res.text.strip()
+        except Exception:
+            time.sleep(1)
+            continue
+    raise RuntimeError("Все модели Gemini временно заняты")
 
-    raise RuntimeError(f"Все модели перегружены или недоступны: {last_error}")
+# Синхронная озвучка через надежный gTTS
+def generate_audio_sync(text: str, filename: str):
+    tts = gTTS(text=text, lang='ru', slow=False)
+    tts.save(filename)
 
-# 8. Шаг 4: Озвучка и отправка
+# 8. Шаг 4: Генерация и отправка
 @dp.message(StoryCreation.waiting_for_voice, F.text)
 async def process_voice_and_generate(message: Message, state: FSMContext):
-    voice_choice = message.text.strip()
-    selected_voice = "ru-RU-DmitryNeural" if "Дмитрий" in voice_choice else "ru-RU-SvetlanaNeural"
-
     data = await state.get_data()
     await state.clear()
 
@@ -161,7 +149,7 @@ async def process_voice_and_generate(message: Message, state: FSMContext):
     audio_path = f"story_{message.chat.id}_{message.message_id}.mp3"
 
     try:
-        # 1. Генерация текста с защитой от 503
+        # 1. Текст сказки
         story_text = await asyncio.to_thread(generate_story_sync, child, hero, theme)
         await message.answer(f"📖 Сказка для {child}\n\n{story_text}")
         
@@ -170,10 +158,9 @@ async def process_voice_and_generate(message: Message, state: FSMContext):
         except Exception:
             pass
 
-        # 2. Озвучка через Edge TTS
+        # 2. Озвучка через gTTS
         try:
-            communicate = edge_tts.Communicate(story_text, selected_voice)
-            await communicate.save(audio_path)
+            await asyncio.to_thread(generate_audio_sync, story_text, audio_path)
 
             voice_file = FSInputFile(audio_path)
             await message.answer_voice(
@@ -193,8 +180,8 @@ async def process_voice_and_generate(message: Message, state: FSMContext):
             await message.answer("Хотите сочинить еще одну сказку?", reply_markup=new_btn)
 
         except Exception as tts_err:
-            logging.error(f"Ошибка озвучки: {tts_err}")
-            await message.answer("Сказка готова текстом выше, но файл озвучки сохранить не удалось.")
+            logging.error(f"Ошибка озвучки gTTS: {tts_err}")
+            await message.answer(f"Сказка готова текстом выше, но файл озвучки сохранить не удалось: {tts_err}")
         finally:
             if os.path.exists(audio_path):
                 try:

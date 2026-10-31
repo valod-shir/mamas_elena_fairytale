@@ -18,7 +18,7 @@ import edge_tts
 
 logging.basicConfig(level=logging.INFO)
 
-# 1. Считываем ключи
+# 1. Считываем ключи окружения
 raw_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("BOT_TOKEN") or ""
 raw_gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
 
@@ -29,7 +29,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_KEY)
 
-# 2. Определяем шаги сценария (FSM)
+# 2. Состояния диалога (FSM)
 class StoryCreation(StatesGroup):
     waiting_for_child_info = State()
     waiting_for_hero = State()
@@ -69,7 +69,7 @@ async def start_cmd(message: Message, state: FSMContext):
     await message.answer(welcome_text, reply_markup=ReplyKeyboardRemove())
     await state.set_state(StoryCreation.waiting_for_child_info)
 
-# 5. Шаг 1: Получаем имя и возраст
+# 5. Шаг 1: Имя и возраст
 @dp.message(StoryCreation.waiting_for_child_info, F.text)
 async def process_child_info(message: Message, state: FSMContext):
     await state.update_data(child_info=message.text.strip())
@@ -79,7 +79,7 @@ async def process_child_info(message: Message, state: FSMContext):
     )
     await state.set_state(StoryCreation.waiting_for_hero)
 
-# 6. Шаг 2: Получаем любимого героя
+# 6. Шаг 2: Герой
 @dp.message(StoryCreation.waiting_for_hero, F.text)
 async def process_hero(message: Message, state: FSMContext):
     await state.update_data(hero=message.text.strip())
@@ -89,7 +89,7 @@ async def process_hero(message: Message, state: FSMContext):
     )
     await state.set_state(StoryCreation.waiting_for_theme)
 
-# 7. Шаг 3: Получаем тему сказки
+# 7. Шаг 3: Тема
 @dp.message(StoryCreation.waiting_for_theme, F.text)
 async def process_theme(message: Message, state: FSMContext):
     theme_text = message.text.strip()
@@ -104,7 +104,7 @@ async def process_theme(message: Message, state: FSMContext):
     )
     await state.set_state(StoryCreation.waiting_for_voice)
 
-# Синхронная генерация через актуальную Gemini
+# Синхронная генерация текста через Gemini
 def generate_story_sync(child_info: str, hero: str, theme: str) -> str:
     system_instruction = (
         "Ты добрый сказочник для малышей. Сочини короткую, терапевтическую, "
@@ -121,7 +121,7 @@ def generate_story_sync(child_info: str, hero: str, theme: str) -> str:
     )
     return response.text.strip()
 
-# 8. Шаг 4: Выбор голоса и отправка готовой сказки
+# 8. Шаг 4: Генерация текста, озвучка и отправка
 @dp.message(StoryCreation.waiting_for_voice, F.text)
 async def process_voice_and_generate(message: Message, state: FSMContext):
     voice_choice = message.text.strip()
@@ -141,14 +141,17 @@ async def process_voice_and_generate(message: Message, state: FSMContext):
     audio_path = f"story_{message.chat.id}_{message.message_id}.mp3"
 
     try:
-        # Вызов генерации без переносов строк в аргументах
+        # 1. Генерация текста
         story_text = await asyncio.to_thread(generate_story_sync, child, hero, theme)
-        
-        # Отправляем текст сказки
         await message.answer(f"📖 Сказка для {child}\n\n{story_text}")
-        await status_msg.edit_text("🎙 Записываю сказку голосом...")
+        
+        # Обновление статуса без риска падения
+        try:
+            await status_msg.edit_text("🎙 Записываю сказку голосом...")
+        except Exception:
+            pass
 
-        # Озвучка через Edge TTS
+        # 2. Озвучка через Edge TTS
         try:
             communicate = edge_tts.Communicate(story_text, selected_voice)
             await communicate.save(audio_path)
@@ -158,7 +161,12 @@ async def process_voice_and_generate(message: Message, state: FSMContext):
                 voice=voice_file, 
                 caption=f"🎧 Сказка про {hero} готова!\nСладких снов малышу ✨"
             )
-            await status_msg.delete()
+            
+            # Удаление статусного сообщения
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
 
             new_btn = ReplyKeyboardMarkup(
                 keyboard=[[KeyboardButton(text="/start 🪄 Создать новую сказку")]],
@@ -181,7 +189,7 @@ async def process_voice_and_generate(message: Message, state: FSMContext):
         logging.error(f"Ошибка генерации: {error_details}")
         await message.answer(f"⚠️ Ошибка создания сказки: {error_details[:200]}")
 
-# 9. Фоновый веб-сервер для прохождения проверки порта Render
+# 9. Веб-сервер для прохождения проверки порта на Render
 async def handle_ping(request):
     return web.Response(text="Bot is running")
 

@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import time
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -18,7 +19,7 @@ import edge_tts
 
 logging.basicConfig(level=logging.INFO)
 
-# 1. Считываем ключи окружения
+# 1. Считываем ключи
 raw_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("BOT_TOKEN") or ""
 raw_gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
 
@@ -29,7 +30,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_KEY)
 
-# 2. Состояния диалога (FSM)
+# 2. FSM состояния
 class StoryCreation(StatesGroup):
     waiting_for_child_info = State()
     waiting_for_hero = State()
@@ -104,7 +105,7 @@ async def process_theme(message: Message, state: FSMContext):
     )
     await state.set_state(StoryCreation.waiting_for_voice)
 
-# Синхронная генерация текста через Gemini
+# Надежная генерация с авто-перебором моделей и защитой от 503
 def generate_story_sync(child_info: str, hero: str, theme: str) -> str:
     system_instruction = (
         "Ты добрый сказочник для малышей. Сочини короткую, терапевтическую, "
@@ -115,13 +116,32 @@ def generate_story_sync(child_info: str, hero: str, theme: str) -> str:
     user_prompt = f"Ребенок: {child_info}\nЛюбимый герой: {hero}\nТема: {theme}"
     full_prompt = f"{system_instruction}\n\nЗапрос:\n{user_prompt}"
 
-    response = ai_client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=full_prompt
-    )
-    return response.text.strip()
+    # Список актуальных быстрых моделей для подстраховки
+    fallback_models = [
+        "gemini-3.8-flash",
+        "gemini-2.0-flash",
+        "gemini-2.5-flash",
+        "gemini-1.5-flash"
+    ]
 
-# 8. Шаг 4: Генерация текста, озвучка и отправка
+    last_error = None
+    for model_name in fallback_models:
+        for attempt in range(2):  # 2 попытки на каждую модель
+            try:
+                response = ai_client.models.generate_content(
+                    model=model_name,
+                    contents=full_prompt
+                )
+                if response and response.text:
+                    return response.text.strip()
+            except Exception as err:
+                last_error = err
+                time.sleep(1.5)  # Пауза перед следующей попыткой
+                continue
+
+    raise RuntimeError(f"Все модели перегружены или недоступны: {last_error}")
+
+# 8. Шаг 4: Озвучка и отправка
 @dp.message(StoryCreation.waiting_for_voice, F.text)
 async def process_voice_and_generate(message: Message, state: FSMContext):
     voice_choice = message.text.strip()
@@ -141,11 +161,10 @@ async def process_voice_and_generate(message: Message, state: FSMContext):
     audio_path = f"story_{message.chat.id}_{message.message_id}.mp3"
 
     try:
-        # 1. Генерация текста
+        # 1. Генерация текста с защитой от 503
         story_text = await asyncio.to_thread(generate_story_sync, child, hero, theme)
         await message.answer(f"📖 Сказка для {child}\n\n{story_text}")
         
-        # Обновление статуса без риска падения
         try:
             await status_msg.edit_text("🎙 Записываю сказку голосом...")
         except Exception:
@@ -162,7 +181,6 @@ async def process_voice_and_generate(message: Message, state: FSMContext):
                 caption=f"🎧 Сказка про {hero} готова!\nСладких снов малышу ✨"
             )
             
-            # Удаление статусного сообщения
             try:
                 await status_msg.delete()
             except Exception:
@@ -189,7 +207,7 @@ async def process_voice_and_generate(message: Message, state: FSMContext):
         logging.error(f"Ошибка генерации: {error_details}")
         await message.answer(f"⚠️ Ошибка создания сказки: {error_details[:200]}")
 
-# 9. Веб-сервер для прохождения проверки порта на Render
+# 9. Фоновый веб-сервер для прохождения проверки порта Render
 async def handle_ping(request):
     return web.Response(text="Bot is running")
 

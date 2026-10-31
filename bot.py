@@ -262,13 +262,13 @@ async def process_hero(message: Message, state: FSMContext):
     )
     await state.set_state(StoryCreation.waiting_for_theme)
 
-# 7. Генерация текста сказки через рабочую модель gemini-3.8-flash
+# 7. Генерация текста сказки через gemini-3.8-flash с защитой от перегрузки (503 / 429)
 async def generate_story_text(child: str, hero: str, theme: str) -> str:
     global ai_client
     if not ai_client:
         ai_client = genai.Client(
             api_key=GEMINI_KEY,
-            http_options=types.HttpOptions(timeout=10000)
+            http_options=types.HttpOptions(timeout=20000)
         )
 
     prompt = (
@@ -278,8 +278,8 @@ async def generate_story_text(child: str, hero: str, theme: str) -> str:
         f"Объем строго 65-85 слов. Только чистый текст без звездочек и спецсимволов."
     )
 
-    # Используем проверенную рабочую модель 3.8-flash с повтором при нагрузке
-    for attempt in range(3):
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
         try:
             res = await asyncio.to_thread(
                 ai_client.models.generate_content,
@@ -289,16 +289,24 @@ async def generate_story_text(child: str, hero: str, theme: str) -> str:
             if res and res.text:
                 return res.text.replace("*", "").replace("#", "").strip()
         except Exception as e:
-            logging.warning(f"Попытка генерации {attempt + 1} не удалась: {e}")
-            await asyncio.sleep(1.0)
+            err_str = str(e)
+            if "503" in err_str or "429" in err_str or "overloaded" in err_str.lower():
+                if attempt == max_attempts:
+                    raise RuntimeError("Сервер нейросети временно перегружен. Пожалуйста, нажмите кнопку создания сказки еще раз.")
+                
+                wait_time = attempt * 2.5
+                logging.warning(f"Сервер перегружен (попытка {attempt}/{max_attempts}), ждем {wait_time}с...")
+                await asyncio.sleep(wait_time)
+            else:
+                raise e
 
-    raise RuntimeError("Сервер нейросети перегружен. Пожалуйста, попробуйте через минуту.")
+    raise RuntimeError("Сервер нейросети временно перегружен. Пожалуйста, повторите попытку.")
 
-# 8. Живая озвучка (мягкий темп чтения)
+# 8. Живая озвучка
 async def generate_audio_natural(text: str, file_path: str):
     try:
         communicate = edge_tts.Communicate(text, "ru-RU-SvetlanaNeural", rate="-10%")
-        await asyncio.wait_for(communicate.save(file_path), timeout=5.0)
+        await asyncio.wait_for(communicate.save(file_path), timeout=6.0)
         if os.path.exists(file_path) and os.path.getsize(file_path) > 500:
             return
     except Exception as e:

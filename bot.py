@@ -22,8 +22,6 @@ from aiogram.types import (
 )
 from google import genai
 from google.genai import types
-import edge_tts
-from gtts import gTTS
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 
@@ -149,7 +147,7 @@ def get_tariffs_inline_kb() -> InlineKeyboardMarkup:
         ]
     )
 
-# 5. Профиль, тарифы и оплата Telegram Stars
+# 5. Профиль и оплата Stars
 @dp.message(F.text == "👤 Мой баланс")
 async def show_balance(message: Message):
     balance, total = get_user_stats(message.from_user.id)
@@ -217,7 +215,7 @@ async def process_successful_payment(message: Message):
         reply_markup=main_menu_keyboard
     )
 
-# 6. Старт и начало создания сказки
+# 6. Старт создания сказки
 @dp.message(CommandStart())
 @dp.message(F.text.startswith("/start"))
 @dp.message(F.text == "🪄 Создать новую сказку")
@@ -244,7 +242,6 @@ async def start_cmd(message: Message, state: FSMContext):
     await message.answer(welcome_text, reply_markup=ReplyKeyboardRemove())
     await state.set_state(StoryCreation.waiting_for_child_info)
 
-# 7. Шаг 1: Имя и возраст
 @dp.message(StoryCreation.waiting_for_child_info, F.text)
 async def process_child_info(message: Message, state: FSMContext):
     await state.update_data(child_info=message.text.strip())
@@ -254,7 +251,6 @@ async def process_child_info(message: Message, state: FSMContext):
     )
     await state.set_state(StoryCreation.waiting_for_hero)
 
-# 8. Шаг 2: Персонаж
 @dp.message(StoryCreation.waiting_for_hero, F.text)
 async def process_hero(message: Message, state: FSMContext):
     await state.update_data(hero=message.text.strip())
@@ -264,13 +260,13 @@ async def process_hero(message: Message, state: FSMContext):
     )
     await state.set_state(StoryCreation.waiting_for_theme)
 
-# 9. Быстрая генерация текста Gemini
-async def generate_story_fast(child: str, hero: str, theme: str) -> str:
+# 7. Генерация текста и живой озвучки через Gemini
+async def generate_story_and_audio(child: str, hero: str, theme: str, audio_path: str):
     global ai_client
     if not ai_client:
         ai_client = genai.Client(
             api_key=GEMINI_KEY,
-            http_options=types.HttpOptions(timeout=10000)
+            http_options=types.HttpOptions(timeout=20000)
         )
 
     prompt = (
@@ -279,65 +275,49 @@ async def generate_story_fast(child: str, hero: str, theme: str) -> str:
         f"Объем строго 65-85 слов. Простые предложения, чистый текст без звездочек и спецсимволов."
     )
 
-    candidate_models = [
-        "gemini-3.8-flash",
-        "gemini-3.8-flash-lite",
-        "gemini-3.8-pro"
-    ]
+    # 1. Генерация текста
+    res = await asyncio.to_thread(
+        ai_client.models.generate_content,
+        model="gemini-3.8-flash",
+        contents=prompt
+    )
+    story_text = res.text.replace("*", "").replace("#", "").strip()
 
-    for model_name in candidate_models:
-        for attempt in range(2):
-            try:
-                res = await asyncio.to_thread(
-                    ai_client.models.generate_content,
-                    model=model_name,
-                    contents=prompt
-                )
-                if res and res.text:
-                    return res.text.replace("*", "").replace("#", "").strip()
-            except Exception as e:
-                err_str = str(e)
-                if "404" in err_str or "NOT_FOUND" in err_str:
-                    break
-                await asyncio.sleep(1.0)
-
-    try:
-        available = await asyncio.to_thread(ai_client.models.list)
-        for m in available:
-            m_name = m.name.replace("models/", "")
-            if "gemini" in m_name and ("flash" in m_name or "pro" in m_name):
-                try:
-                    res = await asyncio.to_thread(
-                        ai_client.models.generate_content,
-                        model=m_name,
-                        contents=prompt
+    # 2. Генерация живого голоса через Gemini Audio
+    audio_prompt = f"Прочитай эту сказку очень нежным, мягким, сказочным и успокаивающим голосом, как добрая мама или бабушка, читающая ребенку на ночь:\n\n{story_text}"
+    
+    audio_res = await asyncio.to_thread(
+        ai_client.models.generate_content,
+        model="gemini-3.8-flash",
+        contents=audio_prompt,
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name="Kore"  # Мягкий и глубокий живой голос
                     )
-                    if res and res.text:
-                        return res.text.replace("*", "").replace("#", "").strip()
-                except Exception:
-                    continue
-    except Exception:
-        pass
+                )
+            )
+        )
+    )
 
-    raise RuntimeError("Сервер нейросети сейчас перегружен. Пожалуйста, попробуйте через минуту.")
+    # Извлекаем аудиобайты из ответа Gemini
+    audio_bytes = None
+    for part in audio_res.candidates[0].content.parts:
+        if part.inline_data and part.inline_data.data:
+            audio_bytes = part.inline_data.data
+            break
 
-# 10. Озвучка
-async def generate_audio_fast(text: str, file_path: str):
-    try:
-        communicate = edge_tts.Communicate(text, "ru-RU-SvetlanaNeural")
-        await asyncio.wait_for(communicate.save(file_path), timeout=3.5)
-        if os.path.exists(file_path) and os.path.getsize(file_path) > 500:
-            return
-    except Exception as e:
-        logging.warning(f"Переключение на gTTS: {e}")
+    if not audio_bytes:
+        raise RuntimeError("Не удалось сформировать аудиопоток")
 
-    def run_gtts():
-        tts = gTTS(text=text, lang='ru', slow=False)
-        tts.save(file_path)
+    with open(audio_path, "wb") as f:
+        f.write(audio_bytes)
 
-    await asyncio.to_thread(run_gtts)
+    return story_text
 
-# 11. Шаг 3: Генерация, отправка и списание с баланса
+# 8. Шаг 3: Финал, списание и отправка
 @dp.message(StoryCreation.waiting_for_theme, F.text)
 async def process_theme_and_finish(message: Message, state: FSMContext):
     theme_text = message.text.strip()
@@ -360,28 +340,21 @@ async def process_theme_and_finish(message: Message, state: FSMContext):
     hero = data.get("hero", "героя")
 
     status_msg = await message.answer(
-        "✨ Волшебство начинается! Сочиняю и озвучиваю сказку...", 
+        "✨ Волшебство начинается! Создаю живую аудиосказку...", 
         reply_markup=ReplyKeyboardRemove()
     )
-    audio_path = f"/tmp/story_{message.chat.id}_{message.message_id}.mp3" if os.path.exists("/tmp") else f"story_{message.chat.id}_{message.message_id}.mp3"
+    audio_path = f"/tmp/story_{message.chat.id}_{message.message_id.real if hasattr(message.message_id, 'real') else message.message_id}.mp3" if os.path.exists("/tmp") else f"story_{message.chat.id}_{message.message_id}.mp3"
 
     try:
-        story_text = await generate_story_fast(child, hero, theme_text)
+        story_text = await generate_story_and_audio(child, hero, theme_text, audio_path)
         await message.answer(f"📖 Сказка для {child}\n\n{story_text}")
-
-        try:
-            await status_msg.edit_text("🎙 Записываю аудиосказку...")
-        except Exception:
-            pass
-
-        await generate_audio_fast(story_text, audio_path)
 
         voice_file = FSInputFile(audio_path)
         remaining = use_one_story(user_id)
 
         await message.answer_voice(
             voice=voice_file, 
-            caption=f"🎧 Аудиосказка про {hero} готова!\nСладких снов малышу ✨\n\n🎁 Осталось сказок на балансе: {remaining} шт."
+            caption=f"🎧 Живая аудиосказка про {hero} готова!\nСладких снов малышу ✨\n\n🎁 Осталось сказок на балансе: {remaining} шт."
         )
 
         try:
@@ -394,7 +367,7 @@ async def process_theme_and_finish(message: Message, state: FSMContext):
     except Exception as e:
         logging.error(f"Ошибка создания сказки: {e}")
         await message.answer(
-            f"⚠️ {str(e)[:200]}\n(Попытка не списана с вашего баланса)", 
+            f"⚠️ Ошибка: {str(e)[:180]}\n(Попытка не списана с вашего баланса)", 
             reply_markup=main_menu_keyboard
         )
     finally:
@@ -404,7 +377,7 @@ async def process_theme_and_finish(message: Message, state: FSMContext):
             except Exception:
                 pass
 
-# 12. Веб-сервер Render
+# 9. Веб-сервер Render
 async def handle_ping(request):
     return web.Response(text="OK")
 
@@ -421,11 +394,8 @@ async def start_server():
 
 async def main():
     print("STARTING BOT SERVICE...", flush=True)
-    # 1. Мгновенно открываем порт для Render
     await start_server()
-    # 2. Создаем таблицу БД
     init_db()
-    # 3. Запускаем бота
     await asyncio.sleep(2)
     await bot.delete_webhook(drop_pending_updates=True)
     print("STARTING TELEGRAM POLLING...", flush=True)

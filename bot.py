@@ -1,7 +1,6 @@
 import os
 import asyncio
 import logging
-import time
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -15,6 +14,7 @@ from aiogram.types import (
     ReplyKeyboardRemove
 )
 from google import genai
+from google.genai import types
 import edge_tts
 from gtts import gTTS
 
@@ -30,12 +30,16 @@ GEMINI_KEY = raw_gemini_key.strip().strip("'\"")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# Инициализируем клиент без долгих внутренних зависаний
 ai_client = None
 if GEMINI_KEY:
     try:
-        ai_client = genai.Client(api_key=GEMINI_KEY)
+        ai_client = genai.Client(
+            api_key=GEMINI_KEY,
+            http_options=types.HttpOptions(timeout=10000) # 10 секунд максимум на запрос
+        )
     except Exception as e:
-        logging.error(f"Ошибка Gemini: {e}")
+        logging.error(f"Ошибка инициализации Gemini: {e}")
 
 # 2. Состояния FSM
 class StoryCreation(StatesGroup):
@@ -64,17 +68,18 @@ voice_keyboard = ReplyKeyboardMarkup(
     one_time_keyboard=True
 )
 
-# 4. Команда /start
+# 4. Команда /start (и кнопка создания новой сказки)
 @dp.message(CommandStart())
+@dp.message(F.text.startswith("/start"))
 async def start_cmd(message: Message, state: FSMContext):
     await state.clear()
     welcome_text = (
-        "👋 **Добро пожаловать в мир добрых сказок!**\n\n"
+        "👋 Добро пожаловать в мир добрых сказок!\n\n"
         "Я помогу создать персональную терапевтическую аудиосказку для вашего малыша.\n\n"
-        "👶 **Шаг 1 из 4:** Напишите имя и возраст ребенка:\n"
-        "*(Например: Влада, полтора года)*"
+        "👶 Шаг 1 из 4: Напишите имя и возраст ребенка:\n"
+        "(Например: Влада, полтора года)"
     )
-    await message.answer(welcome_text, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+    await message.answer(welcome_text, reply_markup=ReplyKeyboardRemove())
     await state.set_state(StoryCreation.waiting_for_child_info)
 
 # 5. Шаг 1: Имя и возраст
@@ -82,9 +87,8 @@ async def start_cmd(message: Message, state: FSMContext):
 async def process_child_info(message: Message, state: FSMContext):
     await state.update_data(child_info=message.text.strip())
     await message.answer(
-        "🧸 **Шаг 2 из 4:** Кто любимый персонаж или игрушка малыша?\n"
-        "*(Например: котенок Мау, зайчик, машинка)*",
-        parse_mode="Markdown"
+        "🧸 Шаг 2 из 4: Кто любимый персонаж или игрушка малыша?\n"
+        "(Например: котенок Мау, зайчик, машинка)"
     )
     await state.set_state(StoryCreation.waiting_for_hero)
 
@@ -93,7 +97,7 @@ async def process_child_info(message: Message, state: FSMContext):
 async def process_hero(message: Message, state: FSMContext):
     await state.update_data(hero=message.text.strip())
     await message.answer(
-        "🎯 **Шаг 3 из 4:** Выберите тему сказки:",
+        "🎯 Шаг 3 из 4: Выберите тему сказки:",
         reply_markup=theme_keyboard
     )
     await state.set_state(StoryCreation.waiting_for_theme)
@@ -108,56 +112,93 @@ async def process_theme(message: Message, state: FSMContext):
 
     await state.update_data(theme=theme_text)
     await message.answer(
-        "🎙 **Шаг 4 из 4:** Каким голосом озвучить сказку?",
+        "🎙 Шаг 4 из 4: Каким голосом озвучить сказку?",
         reply_markup=voice_keyboard
     )
     await state.set_state(StoryCreation.waiting_for_voice)
 
-# Надежная генерация с моделью gemini-3.8-flash и автоповтором при 503
-def generate_story_sync(child: str, hero: str, theme: str) -> str:
+# 8. Быстрая генерация текста с автоматическим обходом 503
+async def generate_story_fast(child: str, hero: str, theme: str) -> str:
     if not ai_client:
-        raise ValueError("GEMINI_API_KEY не задан")
+        raise ValueError("Ключ GEMINI_API_KEY не задан")
 
     prompt = (
-        f"Ты детский сказочник. Сочини короткую, нежную терапевтическую сказку на ночь.\n"
-        f"Ребенок: {child}. Герой: {hero}. Тема: {theme}.\n"
-        f"Объем СТРОГО 70-90 слов. Простые короткие предложения. "
-        f"Пиши чистым текстом БЕЗ спецсимволов (*, #, _), чтобы диктор читал ровно."
+        f"Сочини короткую, ласковую терапевтическую сказку на ночь для малыша.\n"
+        f"Ребенок: {child}. Любимый герой: {hero}. Тема: {theme}.\n"
+        f"Объем строго 65-85 слов. Простые предложения, чистый текст без звездочек и спецсимволов."
     )
 
-    last_error = None
-    # Делаем до 4 попыток с паузой на случай временной пиковой нагрузки
-    for attempt in range(1, 5):
-        try:
-            response = ai_client.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=prompt
-            )
-            if response and response.text:
-                return response.text.replace("*", "").replace("#", "").strip()
-        except Exception as e:
-            last_error = e
-            logging.warning(f"Попытка {attempt} завершилась ошибкой: {e}. Ожидание...")
-            time.sleep(attempt * 1.5)  # 1.5с, затем 3.0с, затем 4.5с
+    # Сначала пробуем актуальные модели напрямую без долгих ожиданий
+    candidate_models = [
+        "gemini-3.8-flash",
+        "gemini-3.8-flash-lite",
+        "gemini-3.8-pro"
+    ]
 
-    raise RuntimeError(f"Сервер Gemini перегружен: {last_error}")
+    last_err = None
+    for model_name in candidate_models:
+        for attempt in range(2):
+            try:
+                res = await asyncio.to_thread(
+                    ai_client.models.generate_content,
+                    model=model_name,
+                    contents=prompt
+                )
+                if res and res.text:
+                    return res.text.replace("*", "").replace("#", "").strip()
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                # Если модели нет (404), сразу переходим к следующей без повтора
+                if "404" in err_str or "NOT_FOUND" in err_str:
+                    break
+                await asyncio.sleep(1.0)
 
-# Озвучка Edge-TTS с переключением на Дмитрий / Светлана
+    # Если все стандартные имена дали сбой, автоматически ищем любую доступную flash модель в аккаунте
+    try:
+        available = await asyncio.to_thread(ai_client.models.list)
+        for m in available:
+            m_name = m.name.replace("models/", "")
+            if "gemini" in m_name and ("flash" in m_name or "pro" in m_name):
+                try:
+                    res = await asyncio.to_thread(
+                        ai_client.models.generate_content,
+                        model=m_name,
+                        contents=prompt
+                    )
+                    if res and res.text:
+                        return res.text.replace("*", "").replace("#", "").strip()
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    raise RuntimeError(f"Сервер Google временно перегружен (503). Пожалуйста, попробуйте через минуту.")
+
+# 9. Быстрая озвучка (Дмитрий / Светлана) без 12-секундных зависаний
 async def generate_audio_fast(text: str, voice_str: str, file_path: str):
     is_male = ("Дмитрий" in voice_str or "папы" in voice_str)
     voice_name = "ru-RU-DmitryNeural" if is_male else "ru-RU-SvetlanaNeural"
 
     try:
-        communicate = edge_tts.Communicate(text, voice_name)
-        await asyncio.wait_for(communicate.save(file_path), timeout=12.0)
+        # Таймаут всего 4.5 секунды: если IP Render заблокирован Microsoft, не ждем зря
+        communicate = edge_tts.Communicate(text, voice_name, rate="-5%")
+        await asyncio.wait_for(communicate.save(file_path), timeout=4.5)
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 500:
+            return "edge"
     except Exception as e:
-        logging.warning(f"Edge TTS сбой ({e}), переключаюсь на gTTS...")
-        def run_fallback():
-            tts = gTTS(text=text, lang='ru', slow=False)
-            tts.save(file_path)
-        await asyncio.to_thread(run_fallback)
+        logging.warning(f"Быстрое переключение с Edge-TTS на резервный синтезатор: {e}")
 
-# 8. Шаг 4: Генерация и отправка
+    # Мгновенный резерв через Google TTS
+    def run_gtts():
+        # Для папы включаем более медленный и размеренный темп чтения
+        tts = gTTS(text=text, lang='ru', slow=is_male)
+        tts.save(file_path)
+
+    await asyncio.to_thread(run_gtts)
+    return "gtts"
+
+# 10. Шаг 4: Финальная сборка и отправка
 @dp.message(StoryCreation.waiting_for_voice, F.text)
 async def process_voice_and_finish(message: Message, state: FSMContext):
     voice_choice = message.text.strip()
@@ -166,31 +207,38 @@ async def process_voice_and_finish(message: Message, state: FSMContext):
 
     child = data.get("child_info", "малыша")
     hero = data.get("hero", "героя")
-    theme = data.get("theme", "сон")
+    theme = data.get("theme", "добрый сон")
 
-    status_msg = await message.answer("✨ Волшебство начинается! Сочиняю сказку...", reply_markup=ReplyKeyboardRemove())
+    status_msg = await message.answer(
+        "✨ Волшебство начинается! Сочиняю сказку (это займет ~10 секунд)...", 
+        reply_markup=ReplyKeyboardRemove()
+    )
     audio_path = f"story_{message.chat.id}_{message.message_id}.mp3"
 
     try:
-        # Генерация текста
-        story_text = await asyncio.to_thread(generate_story_sync, child, hero, theme)
+        # 1. Генерируем текст
+        story_text = await generate_story_fast(child, hero, theme)
         await message.answer(f"📖 Сказка для {child}\n\n{story_text}")
 
         try:
-            await status_msg.edit_text("🎙 Записываю сказку голосом...")
+            await status_msg.edit_text("🎙 Записываю голос...")
         except Exception:
             pass
 
-        # Генерация аудио
-        await generate_audio_fast(story_text, voice_choice, audio_path)
+        # 2. Генерируем звук
+        engine_used = await generate_audio_fast(story_text, voice_choice, audio_path)
 
         voice_file = FSInputFile(audio_path)
         is_male = ("Дмитрий" in voice_choice or "папы" in voice_choice)
-        voice_label = "папы Дмитрия" if is_male else "мамы Светланы"
+        
+        if engine_used == "edge":
+            voice_label = "голос папы Дмитрия" if is_male else "голос мамы Светланы"
+        else:
+            voice_label = "спокойный темп" if is_male else "нежный голос"
 
         await message.answer_voice(
             voice=voice_file, 
-            caption=f"🎧 Сказка про {hero}\nОзвучено голосом {voice_label} ✨"
+            caption=f"🎧 Сказка про {hero} ({voice_label})\nСладких снов малышу ✨"
         )
 
         try:
@@ -206,7 +254,11 @@ async def process_voice_and_finish(message: Message, state: FSMContext):
 
     except Exception as e:
         logging.error(f"Ошибка создания сказки: {e}")
-        await message.answer(f"⚠️ Ошибка создания сказки: {str(e)[:200]}")
+        retry_btn = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="/start 🔄 Попробовать снова")]],
+            resize_keyboard=True
+        )
+        await message.answer(f"⚠️ {str(e)[:200]}", reply_markup=retry_btn)
     finally:
         if os.path.exists(audio_path):
             try:
@@ -214,7 +266,7 @@ async def process_voice_and_finish(message: Message, state: FSMContext):
             except Exception:
                 pass
 
-# 9. Проверенный веб-сервер Render (AppRunner)
+# 11. Веб-сервер Render для мгновенного открытия порта
 async def handle_ping(request):
     return web.Response(text="OK")
 
@@ -229,7 +281,11 @@ async def start_server():
     await site.start()
 
 async def main():
+    # Сначала мгновенно открываем порт для Render
     await start_server()
+    # Даем 2 секунды старому контейнеру завершиться и сбрасываем зависшие запросы
+    await asyncio.sleep(2)
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

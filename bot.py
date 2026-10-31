@@ -3,6 +3,7 @@ import sys
 import sqlite3
 import asyncio
 import logging
+import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -20,7 +21,6 @@ from aiogram.types import (
     LabeledPrice,
     PreCheckoutQuery
 )
-from google import genai
 import edge_tts
 from gtts import gTTS
 
@@ -230,7 +230,7 @@ async def start_cmd(message: Message, state: FSMContext):
 async def process_child_info(message: Message, state: FSMContext):
     await state.update_data(child_info=message.text.strip())
     await message.answer(
-        "🧸 Шаг 2 из 3: Кто любимый персонаж или игрушка малыша?\n(Например: котенок Мау, зайчик Снежок, лошадка Майя)",
+        "🧸 Шаг 2 из 3: Кто любимый персонаж или игрушка малыша?\n(Например: котенок, зайчик Снежок, машинка)",
     )
     await state.set_state(StoryCreation.waiting_for_hero)
 
@@ -241,7 +241,7 @@ async def process_hero(message: Message, state: FSMContext):
     await state.set_state(StoryCreation.waiting_for_theme)
 
 # ==========================================
-# 6. ГЕНЕРАЦИЯ ТЕКСТА И АУДИО (УЛУЧШЕНО)
+# 6. ГЕНЕРАЦИЯ ТЕКСТА (БЕЗ GOOGLE SDK - НА ПРЯМЫХ HTTP ЗАПРОСАХ)
 # ==========================================
 async def generate_story_text(child: str, hero: str, theme: str) -> str:
     prompt = (
@@ -251,7 +251,7 @@ async def generate_story_text(child: str, hero: str, theme: str) -> str:
         f"Объем строго 65-85 слов. Только чистый текст без звездочек и спецсимволов."
     )
 
-    # Динамический сбор всех ключей из переменных окружения
+    # Динамический сбор всех ключей
     keys = []
     main_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if main_key: keys.append(main_key.strip().strip("'\""))
@@ -261,36 +261,45 @@ async def generate_story_text(child: str, hero: str, theme: str) -> str:
         if val: keys.append(val.strip().strip("'\""))
         
     if not keys:
-        raise RuntimeError("API ключ не настроен на сервере.")
+        raise RuntimeError("API ключ не настроен в Render.")
 
-    # Используем исключительно существующие рабочие модели Google
     models = ["gemini-1.5-flash", "gemini-1.5-flash-8b"]
+    last_error = "Неизвестная ошибка связи"
 
-    for key_idx, current_key in enumerate(keys):
-        client = genai.Client(api_key=current_key)
-        for model_name in models:
-            try:
-                # Надежное ожидание средствами Python без HttpOptions
-                res = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        client.models.generate_content,
-                        model=model_name,
-                        contents=prompt
-                    ),
-                    timeout=20.0
-                )
-                if res and res.text:
-                    logging.info(f"Сказка создана! (Ключ #{key_idx+1}, Модель {model_name})")
-                    return res.text.replace("*", "").replace("#", "").strip()
-            except Exception as e:
-                logging.warning(f"Пропуск модели {model_name} (Ключ #{key_idx+1}): {e}")
+    # Отправляем запросы НАПРЯМУЮ, минуя багованные библиотеки, с помощью aiohttp
+    async with aiohttp.ClientSession() as session:
+        for key_idx, current_key in enumerate(keys):
+            for model_name in models:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={current_key}"
+                payload = {
+                    "contents": [{"parts": [{"text": prompt}]}]
+                }
+                try:
+                    async with session.post(url, json=payload, timeout=20.0) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            try:
+                                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                                logging.info(f"Сказка создана! (Модель {model_name})")
+                                return text.replace("*", "").replace("#", "").strip()
+                            except (KeyError, IndexError):
+                                last_error = "Успешно, но Гугл прислал пустой текст."
+                        else:
+                            err_text = await resp.text()
+                            # Если ошибка есть, мы её сохраняем, чтобы показать вам!
+                            last_error = f"Код {resp.status}: {err_text[:120]}"
+                            logging.warning(f"Ошибка API: {last_error}")
+                except Exception as e:
+                    last_error = f"Сетевая ошибка: {str(e)}"
+                    logging.warning(last_error)
+                
                 await asyncio.sleep(1.0)
 
-    raise RuntimeError("Все сервера Google сейчас перегружены. Пожалуйста, попробуйте еще раз через минуту.")
+    # Если ничего не помогло, бот выведет РЕАЛЬНУЮ причину прямо в чат Telegram
+    raise RuntimeError(f"Сбой подключения.\nТехническая причина: {last_error}")
 
 async def generate_audio_natural(text: str, file_path: str):
     try:
-        # Увеличен тайм-аут до 12 секунд для приоритета нейросетевого голоса
         communicate = edge_tts.Communicate(text, "ru-RU-SvetlanaNeural", rate="-10%")
         await asyncio.wait_for(communicate.save(file_path), timeout=12.0)
         if os.path.exists(file_path) and os.path.getsize(file_path) > 500:
@@ -350,9 +359,9 @@ async def process_theme_and_finish(message: Message, state: FSMContext):
 
     except Exception as e:
         logging.error(f"Ошибка: {e}")
-        await message.answer(f"⚠️ {str(e)[:200]}\n(Попытка не списана)", reply_markup=main_menu_keyboard)
+        # Теперь бот выведет точную подробную ошибку от Google
+        await message.answer(f"⚠️ {str(e)[:400]}\n(Попытка не списана)", reply_markup=main_menu_keyboard)
     finally:
-        # Гарантированное удаление файла для предотвращения переполнения диска
         if os.path.exists(audio_path):
             try: os.remove(audio_path)
             except Exception: pass
@@ -371,7 +380,6 @@ async def start_server():
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
     logging.info(f"WEB SERVER STARTED ON PORT {port}")
 
 async def main():
@@ -380,7 +388,6 @@ async def main():
     init_db()
     await asyncio.sleep(1)
     
-    # Сбрасываем старые обновления, чтобы избежать TelegramConflictError
     await bot.delete_webhook(drop_pending_updates=True)
     logging.info("STARTING TELEGRAM POLLING...")
     await dp.start_polling(bot)

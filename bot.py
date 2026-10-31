@@ -22,6 +22,8 @@ from aiogram.types import (
 )
 from google import genai
 from google.genai import types
+import edge_tts
+from gtts import gTTS
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 
@@ -260,64 +262,58 @@ async def process_hero(message: Message, state: FSMContext):
     )
     await state.set_state(StoryCreation.waiting_for_theme)
 
-# 7. Генерация текста и живой озвучки через Gemini
-async def generate_story_and_audio(child: str, hero: str, theme: str, audio_path: str):
+# 7. Генерация текста сказки через Gemini с акцентом на естественность
+async def generate_story_text(child: str, hero: str, theme: str) -> str:
     global ai_client
     if not ai_client:
         ai_client = genai.Client(
             api_key=GEMINI_KEY,
-            http_options=types.HttpOptions(timeout=20000)
+            http_options=types.HttpOptions(timeout=10000)
         )
 
     prompt = (
-        f"Сочини короткую, ласковую терапевтическую сказку на ночь для малыша.\n"
+        f"Сочини очень мягкую, успокаивающую сказку на ночь для малыша.\n"
         f"Ребенок: {child}. Любимый герой: {hero}. Тема: {theme}.\n"
-        f"Объем строго 65-85 слов. Простые предложения, чистый текст без звездочек и спецсимволов."
+        f"Используй плавные переходы, тире и многоточия, чтобы текст звучал мелодично и неторопливо.\n"
+        f"Объем строго 65-85 слов. Только чистый текст без звездочек и спецсимволов."
     )
 
-    # 1. Генерация текста
-    res = await asyncio.to_thread(
-        ai_client.models.generate_content,
-        model="gemini-3.8-flash",
-        contents=prompt
-    )
-    story_text = res.text.replace("*", "").replace("#", "").strip()
+    candidate_models = ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.8-pro"]
 
-    # 2. Генерация живого голоса через Gemini Audio
-    audio_prompt = f"Прочитай эту сказку очень нежным, мягким, сказочным и успокаивающим голосом, как добрая мама или бабушка, читающая ребенку на ночь:\n\n{story_text}"
-    
-    audio_res = await asyncio.to_thread(
-        ai_client.models.generate_content,
-        model="gemini-3.8-flash",
-        contents=audio_prompt,
-        config=types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Kore"  # Мягкий и глубокий живой голос
-                    )
+    for model_name in candidate_models:
+        for attempt in range(2):
+            try:
+                res = await asyncio.to_thread(
+                    ai_client.models.generate_content,
+                    model=model_name,
+                    contents=prompt
                 )
-            )
-        )
-    )
+                if res and res.text:
+                    return res.text.replace("*", "").replace("#", "").strip()
+            except Exception:
+                await asyncio.sleep(1.0)
 
-    # Извлекаем аудиобайты из ответа Gemini
-    audio_bytes = None
-    for part in audio_res.candidates[0].content.parts:
-        if part.inline_data and part.inline_data.data:
-            audio_bytes = part.inline_data.data
-            break
+    raise RuntimeError("Сервер нейросети перегружен. Пожалуйста, попробуйте через минуту.")
 
-    if not audio_bytes:
-        raise RuntimeError("Не удалось сформировать аудиопоток")
+# 8. Живая озвучка (медленный, мягкий темп чтения колыбельной)
+async def generate_audio_natural(text: str, file_path: str):
+    try:
+        # rate="-10%" делает голос спокойным и неторопливым, pitch="+0Hz" сохраняет естественность
+        communicate = edge_tts.Communicate(text, "ru-RU-SvetlanaNeural", rate="-10%")
+        await asyncio.wait_for(communicate.save(file_path), timeout=5.0)
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 500:
+            return
+    except Exception as e:
+        logging.warning(f"edge-tts таймаут, используем плавный gTTS: {e}")
 
-    with open(audio_path, "wb") as f:
-        f.write(audio_bytes)
+    # Если сработал резерв gTTS, замедлим его через slow=True, чтобы он звучал мягче
+    def run_gtts():
+        tts = gTTS(text=text, lang='ru', slow=True)
+        tts.save(file_path)
 
-    return story_text
+    await asyncio.to_thread(run_gtts)
 
-# 8. Шаг 3: Финал, списание и отправка
+# 9. Шаг 3: Финал, списание и отправка
 @dp.message(StoryCreation.waiting_for_theme, F.text)
 async def process_theme_and_finish(message: Message, state: FSMContext):
     theme_text = message.text.strip()
@@ -340,21 +336,28 @@ async def process_theme_and_finish(message: Message, state: FSMContext):
     hero = data.get("hero", "героя")
 
     status_msg = await message.answer(
-        "✨ Волшебство начинается! Создаю живую аудиосказку...", 
+        "✨ Волшебство начинается! Рассказываю сказку...", 
         reply_markup=ReplyKeyboardRemove()
     )
     audio_path = f"/tmp/story_{message.chat.id}_{message.message_id.real if hasattr(message.message_id, 'real') else message.message_id}.mp3" if os.path.exists("/tmp") else f"story_{message.chat.id}_{message.message_id}.mp3"
 
     try:
-        story_text = await generate_story_and_audio(child, hero, theme_text, audio_path)
+        story_text = await generate_story_text(child, hero, theme_text)
         await message.answer(f"📖 Сказка для {child}\n\n{story_text}")
+
+        try:
+            await status_msg.edit_text("🎙 Записываю мягкий голос...")
+        except Exception:
+            pass
+
+        await generate_audio_natural(story_text, audio_path)
 
         voice_file = FSInputFile(audio_path)
         remaining = use_one_story(user_id)
 
         await message.answer_voice(
             voice=voice_file, 
-            caption=f"🎧 Живая аудиосказка про {hero} готова!\nСладких снов малышу ✨\n\n🎁 Осталось сказок на балансе: {remaining} шт."
+            caption=f"🎧 Аудиосказка про {hero} готова!\nСладких снов малышу ✨\n\n🎁 Осталось сказок на балансе: {remaining} шт."
         )
 
         try:
@@ -367,7 +370,7 @@ async def process_theme_and_finish(message: Message, state: FSMContext):
     except Exception as e:
         logging.error(f"Ошибка создания сказки: {e}")
         await message.answer(
-            f"⚠️ Ошибка: {str(e)[:180]}\n(Попытка не списана с вашего баланса)", 
+            f"⚠️ {str(e)[:200]}\n(Попытка не списана с вашего баланса)", 
             reply_markup=main_menu_keyboard
         )
     finally:
@@ -377,7 +380,7 @@ async def process_theme_and_finish(message: Message, state: FSMContext):
             except Exception:
                 pass
 
-# 9. Веб-сервер Render
+# 10. Веб-сервер Render
 async def handle_ping(request):
     return web.Response(text="OK")
 

@@ -199,7 +199,7 @@ async def show_tariffs(message: Message):
     await message.answer(
         f"💎 Пополнение баланса сказок\n"
         f"Сейчас у вас доступно: {balance} шт.\n\n"
-        f"Выберите пакет для мгновенной оплаты Звёздами Telegram (⭐️):",
+        f"Выберите пакет для мгновенной оплаты Звёздами (⭐️):",
         reply_markup=get_tariffs_inline_kb()
     )
 
@@ -319,7 +319,6 @@ async def fetch_available_models(session: aiohttp.ClientSession, api_key: str) -
                         if not any(x in name.lower() for x in ["vision", "embedding", "imagen", "aqa", "tts", "thinking", "exp"]):
                             valid_models.append(name)
                 
-                # Приоритет отдаем моделям 2.0-flash и 1.5-flash, так как они не тратят токены на скрытые размышления
                 def model_priority(m_name: str):
                     m_low = m_name.lower()
                     if "2.0-flash" in m_low and "lite" not in m_low:
@@ -335,7 +334,6 @@ async def fetch_available_models(session: aiohttp.ClientSession, api_key: str) -
                 valid_models.sort(key=model_priority)
                 if valid_models:
                     cached_models_by_key[api_key] = valid_models
-                    logging.info(f"Найдены модели: {valid_models[:5]}")
                     return valid_models
     except Exception as e:
         logging.warning(f"Ошибка при запросе списка моделей: {e}")
@@ -366,7 +364,6 @@ async def generate_story_text(child: str, hero: str, theme: str) -> str:
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.7,
-            # Увеличенный лимит 4096 гарантирует, что текст никогда не оборвется на полуслове
             "maxOutputTokens": 4096
         },
         "safetySettings": [
@@ -398,35 +395,29 @@ async def generate_story_text(child: str, hero: str, theme: str) -> str:
                             if candidates and "content" in candidates[0]:
                                 finish_reason = candidates[0].get("finishReason", "")
                                 parts = candidates[0]["content"].get("parts", [])
-                                # Собираем все текстовые блоки ответа
                                 full_raw_text = "".join(p.get("text", "") for p in parts if "text" in p)
                                 clean = clean_text_for_tts(full_raw_text)
                                 word_count = len(clean.split())
 
-                                # Проверяем, что сказка длинная (не менее 50 слов) и не оборвалась на полуслове
                                 if word_count >= 50 and finish_reason != "MAX_TOKENS":
                                     current_key_index = key_idx
                                     logging.info(f"Сказка создана ({word_count} слов): Ключ #{key_idx+1}, {model_path}")
                                     return clean
                                 else:
-                                    last_error = f"Слишком короткий ответ ({word_count} слов, причина: {finish_reason})"
-                                    logging.warning(f"Модель {model_path} вернула обрезанный текст ({word_count} слов). Пробуем другую...")
+                                    last_error = f"Короткий ответ ({word_count} слов, причина: {finish_reason})"
                             else:
                                 last_error = f"Пустой ответ от {model_path}"
                         else:
                             err_body = await resp.text()
                             last_error = f"Код {resp.status} ({model_path})"
-                            logging.warning(f"Отказ {model_path} [Ключ #{key_idx+1}]: {err_body[:120]}")
                             if resp.status in (429, 503):
                                 await asyncio.sleep(1.0)
                 except Exception as e:
                     last_error = f"Ошибка связи ({model_path}): {str(e)[:80]}"
-                    logging.warning(last_error)
 
     raise RuntimeError(f"Не удалось сгенерировать полную сказку ({last_error}). Пожалуйста, нажмите кнопку еще раз.")
 
 async def generate_audio_natural(text: str, file_path: str):
-    # Для сказки в 150-220 слов выделяем до 25 секунд на синтез живого голоса
     voices = ["ru-RU-SvetlanaNeural", "ru-RU-DariyaNeural"]
     tts_text = text.replace("\n\n", " ... ").replace("\n", " ")
 
@@ -438,7 +429,7 @@ async def generate_audio_natural(text: str, file_path: str):
                 logging.info(f"Аудио успешно записано голосом {voice}")
                 return
         except Exception as e:
-            logging.warning(f"Голос {voice} не ответил вовремя, переключаю: {e}")
+            logging.warning(f"Голос {voice} не ответил вовремя: {e}")
 
     logging.info("Переход на резервную озвучку gTTS...")
     def run_gtts():
@@ -536,5 +527,36 @@ async def start_server():
     app = web.Application()
     app.router.add_get('/', handle_ping)
     app.router.add_get('/health', handle_ping)
-    port = int(
+    port = int(os.environ.get("PORT", 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logging.info(f"WEB SERVER SUCCESSFULLY BOUND TO PORT {port}")
+    return runner
 
+async def main():
+    logging.info("STARTING BOT SERVICE...")
+    server_runner = await start_server()
+    init_db()
+    
+    keys_count = len(get_all_gemini_keys())
+    logging.info(f"Загружено ключей Gemini API: {keys_count} шт.")
+
+    await asyncio.sleep(8)
+    
+    await bot.delete_webhook(drop_pending_updates=True)
+    logging.info("STARTING TELEGRAM POLLING...")
+    
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        logging.info("SHUTTING DOWN GRACEFULLY...")
+        await bot.session.close()
+        await server_runner.cleanup()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Bot stopped.")

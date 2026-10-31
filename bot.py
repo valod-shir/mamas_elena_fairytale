@@ -19,7 +19,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-VOICE = "ru-RU-SvetlanaNeural"
+VOICE = "ru-RU-DariyaNeural"
 
 class StoryForm(StatesGroup):
     waiting_for_details = State()
@@ -116,7 +116,7 @@ async def generate_story(message: types.Message, state: FSMContext):
 
     audio_path = f"story_{message.from_user.id}.mp3"
     try:
-        communicate = edge_tts.Communicate(story_text, VOICE)
+        communicate = edge_tts.Communicate(story_text, VOICE, rate="-15%", pitch="-2Hz")
         await communicate.save(audio_path)
 
         audio_file = FSInputFile(audio_path)

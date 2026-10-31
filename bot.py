@@ -21,7 +21,6 @@ from aiogram.types import (
     PreCheckoutQuery
 )
 from google import genai
-from google.genai import types
 import edge_tts
 from gtts import gTTS
 
@@ -36,7 +35,6 @@ GEMINI_KEY = raw_gemini_key.strip().strip("'\"")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-ai_client = None
 
 # 2. База данных SQLite в надежной директории
 DB_PATH = "/tmp/users.db" if os.path.exists("/tmp") else "users.db"
@@ -262,15 +260,8 @@ async def process_hero(message: Message, state: FSMContext):
     )
     await state.set_state(StoryCreation.waiting_for_theme)
 
-# 7. Генерация текста сказки через gemini-3.8-flash с защитой от перегрузки (503 / 429)
+# 7. Безотказная генерация без конфликта HttpOptions
 async def generate_story_text(child: str, hero: str, theme: str) -> str:
-    global ai_client
-    if not ai_client:
-        ai_client = genai.Client(
-            api_key=GEMINI_KEY,
-            http_options=types.HttpOptions(timeout=20000)
-        )
-
     prompt = (
         f"Сочини очень мягкую, успокаивающую сказку на ночь для малыша.\n"
         f"Ребенок: {child}. Любимый герой: {hero}. Тема: {theme}.\n"
@@ -278,29 +269,40 @@ async def generate_story_text(child: str, hero: str, theme: str) -> str:
         f"Объем строго 65-85 слов. Только чистый текст без звездочек и спецсимволов."
     )
 
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            res = await asyncio.to_thread(
-                ai_client.models.generate_content,
-                model="gemini-3.8-flash",
-                contents=prompt
-            )
-            if res and res.text:
-                return res.text.replace("*", "").replace("#", "").strip()
-        except Exception as e:
-            err_str = str(e)
-            if "503" in err_str or "429" in err_str or "overloaded" in err_str.lower():
-                if attempt == max_attempts:
-                    raise RuntimeError("Сервер нейросети временно перегружен. Пожалуйста, нажмите кнопку создания сказки еще раз.")
-                
-                wait_time = attempt * 2.5
-                logging.warning(f"Сервер перегружен (попытка {attempt}/{max_attempts}), ждем {wait_time}с...")
-                await asyncio.sleep(wait_time)
-            else:
-                raise e
+    # Собираем все ключи (если добавите запасные в Render)
+    keys = []
+    for k_name in ["GEMINI_API_KEY", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3"]:
+        val = os.environ.get(k_name, "").strip().strip("'\"")
+        if val:
+            keys.append(val)
+    if not keys and GEMINI_KEY:
+        keys = [GEMINI_KEY]
 
-    raise RuntimeError("Сервер нейросети временно перегружен. Пожалуйста, повторите попытку.")
+    # Каскад моделей: от самых быстрых и стабильных к резервным
+    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-3.8-flash"]
+
+    for current_key in keys:
+        # Инициализируем клиент БЕЗ http_options, которые вызывали 504 DEADLINE_EXCEEDED
+        client = genai.Client(api_key=current_key)
+        
+        for model_name in models:
+            try:
+                # Ограничиваем ожидание 15 секундами средствами самого Python
+                res = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        client.models.generate_content,
+                        model=model_name,
+                        contents=prompt
+                    ),
+                    timeout=15.0
+                )
+                if res and res.text:
+                    return res.text.replace("*", "").replace("#", "").strip()
+            except Exception as e:
+                logging.warning(f"Модель {model_name} пропустила ход: {e}")
+                await asyncio.sleep(1.0)
+
+    raise RuntimeError("Все бесплатные линии сейчас заняты. Пожалуйста, нажмите кнопку создания сказки еще раз через минуту.")
 
 # 8. Живая озвучка
 async def generate_audio_natural(text: str, file_path: str):
@@ -344,7 +346,8 @@ async def process_theme_and_finish(message: Message, state: FSMContext):
         "✨ Волшебство начинается! Рассказываю сказку...", 
         reply_markup=ReplyKeyboardRemove()
     )
-    audio_path = f"/tmp/story_{message.chat.id}_{message.message_id.real if hasattr(message.message_id, 'real') else message.message_id}.mp3" if os.path.exists("/tmp") else f"story_{message.chat.id}_{message.message_id}.mp3"
+    msg_id = message.message_id.real if hasattr(message.message_id, 'real') else message.message_id
+    audio_path = f"/tmp/story_{message.chat.id}_{msg_id}.mp3" if os.path.exists("/tmp") else f"story_{message.chat.id}_{msg_id}.mp3"
 
     try:
         story_text = await generate_story_text(child, hero, theme_text)
@@ -411,3 +414,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    

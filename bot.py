@@ -45,13 +45,10 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Защита от двойного нажатия во время генерации
 active_generations = set()
-# Индекс последнего успешного ключа для равномерного распределения нагрузки
 current_key_index = 0
 
 def get_all_gemini_keys() -> list[str]:
-    """Собирает все доступные ключи из переменных окружения Render."""
     keys = []
     candidates = [
         "GEMINI_API_KEY", "GOOGLE_API_KEY",
@@ -61,7 +58,6 @@ def get_all_gemini_keys() -> list[str]:
     for var_name in candidates:
         val = os.environ.get(var_name, "")
         if val:
-            # Поддержка передачи нескольких ключей через запятую в одной переменной
             for part in val.split(","):
                 clean_k = part.strip().strip("'\"")
                 if clean_k and clean_k not in keys:
@@ -274,7 +270,7 @@ async def start_cmd(message: Message, state: FSMContext):
         f"👋 Добро пожаловать в мир добрых сказок!\n"
         f"🎁 Доступно сказок на балансе: {balance} шт.\n\n"
         f"👶 Шаг 1 из 3: Напишите имя и возраст ребенка:\n"
-        f"(Например: Влада, 3 года)",
+        f"(Например: Руслан, 3 года)",
         reply_markup=ReplyKeyboardRemove()
     )
     await state.set_state(StoryCreation.waiting_for_child_info)
@@ -284,7 +280,7 @@ async def process_child_info(message: Message, state: FSMContext):
     await state.update_data(child_info=message.text.strip())
     await message.answer(
         "🧸 Шаг 2 из 3: Кто любимый персонаж или игрушка малыша?\n"
-        "(Например: котенок Мау, зайчик Снежок, машинка)"
+        "(Например: попугай Кеша, зайчик Снежок, машинка)"
     )
     await state.set_state(StoryCreation.waiting_for_hero)
 
@@ -298,13 +294,48 @@ async def process_hero(message: Message, state: FSMContext):
     await state.set_state(StoryCreation.waiting_for_theme)
 
 # ==========================================
-# 6. ПУЛЕНЕПРОБИВАЕМАЯ ГЕНЕРАЦИЯ ТЕКСТА И АУДИО
+# 6. АВТОМАТИЧЕСКИЙ ПОИСК РАБОЧИХ МОДЕЛЕЙ (БЕЗ ОШИБКИ 404)
 # ==========================================
 def clean_text_for_tts(text: str) -> str:
-    """Очищает текст от любых спецсимволов и разметки для идеальной озвучки."""
     text = re.sub(r'[*#_~`>|]', '', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
+
+async def fetch_available_models(session: aiohttp.ClientSession, api_key: str) -> list[str]:
+    """Спрашивает у самого Google список реально доступных для этого ключа моделей."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    try:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                valid_models = []
+                for m in data.get("models", []):
+                    name = m.get("name", "")  # формат 'models/gemini-...'
+                    methods = m.get("supportedGenerationMethods", [])
+                    if "generateContent" in methods and "gemini" in name.lower():
+                        # Исключаем узкоспециализированные модели (vision/embedding/audio)
+                        if not any(x in name.lower() for x in ["vision", "embedding", "imagen", "aqa", "tts", "thinking"]):
+                            valid_models.append(name)
+                
+                # Сортируем так, чтобы быстрые flash-модели шли первыми
+                valid_models.sort(key=lambda x: (0 if "flash" in x.lower() else 1, x))
+                if valid_models:
+                    logging.info(f"Найдены доступные модели для ключа: {valid_models[:5]}")
+                    return valid_models
+            else:
+                err = await resp.text()
+                logging.warning(f"Не удалось получить список моделей ({resp.status}): {err[:120]}")
+    except Exception as e:
+        logging.warning(f"Ошибка при запросе списка моделей: {e}")
+
+    # Запасной список, если запрос каталога не сработал
+    return [
+        "models/gemini-2.0-flash",
+        "models/gemini-1.5-flash-latest",
+        "models/gemini-1.5-flash-002",
+        "models/gemini-1.5-pro-latest",
+        "models/gemini-pro"
+    ]
 
 async def generate_story_text(child: str, hero: str, theme: str) -> str:
     global current_key_index
@@ -319,32 +350,16 @@ async def generate_story_text(child: str, hero: str, theme: str) -> str:
         f"Объем строго 65-85 слов. Напиши только чистый текст самой сказки на русском языке без заголовков и звездочек."
     )
 
-    # Полный список актуальных бесплатных моделей (перебираются по очереди при перегрузке)
-    endpoints = [
-        ("v1beta", "gemini-2.0-flash"),
-        ("v1beta", "gemini-2.0-flash-lite"),
-        ("v1beta", "gemini-1.5-flash"),
-        ("v1", "gemini-1.5-flash"),
-        ("v1beta", "gemini-1.5-flash-8b"),
-        ("v1beta", "gemini-2.5-flash")
-    ]
-
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.7,
-            "maxOutputTokens": 350
-        },
-        "safetySettings": [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-        ]
+            "maxOutputTokens": 400
+        }
     }
 
     last_error = "Неизвестная ошибка"
-    timeout_cfg = aiohttp.ClientTimeout(total=18.0, connect=6.0)
+    timeout_cfg = aiohttp.ClientTimeout(total=20.0, connect=8.0)
 
     async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
         num_keys = len(keys)
@@ -352,8 +367,12 @@ async def generate_story_text(child: str, hero: str, theme: str) -> str:
             key_idx = (current_key_index + k_offset) % num_keys
             api_key = keys[key_idx]
 
-            for api_ver, model_name in endpoints:
-                url = f"https://generativelanguage.googleapis.com/{api_ver}/models/{model_name}:generateContent?key={api_key}"
+            # 1. Запрашиваем у Google точные имена моделей, которые существуют на этом ключе
+            available_models = await fetch_available_models(session, api_key)
+
+            # 2. Перебираем только реально существующие модели
+            for model_path in available_models:
+                url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:generateContent?key={api_key}"
                 try:
                     async with session.post(url, json=payload) as resp:
                         if resp.status == 200:
@@ -362,32 +381,25 @@ async def generate_story_text(child: str, hero: str, theme: str) -> str:
                             if candidates and "content" in candidates[0]:
                                 parts = candidates[0]["content"].get("parts", [])
                                 if parts and "text" in parts[0]:
-                                    raw_text = parts[0]["text"]
-                                    clean = clean_text_for_tts(raw_text)
+                                    clean = clean_text_for_tts(parts[0]["text"])
                                     if len(clean) > 20:
-                                        current_key_index = key_idx  # Запоминаем рабочий ключ
-                                        logging.info(f"Сказка успешно создана: Ключ #{key_idx+1}, {api_ver}/{model_name}")
+                                        current_key_index = key_idx
+                                        logging.info(f"Сказка успешно создана: Ключ #{key_idx+1}, {model_path}")
                                         return clean
-                            last_error = f"Пустой ответ от {model_name}"
-                        elif resp.status in (429, 503, 504):
-                            last_error = f"Перегрузка ({resp.status}) на {model_name}"
-                            logging.warning(f"Ключ #{key_idx+1} [{model_name}] занят ({resp.status}), переключаю...")
-                            await asyncio.sleep(0.7)
+                            last_error = f"Пустой ответ от {model_path}"
                         else:
                             err_body = await resp.text()
-                            last_error = f"Код {resp.status} ({model_name})"
-                            logging.warning(f"Пропуск {api_ver}/{model_name}: {err_body[:120]}")
-                except asyncio.TimeoutError:
-                    last_error = f"Таймаут ожидания ({model_name})"
-                    logging.warning(f"Таймаут на {model_name}, пробуем следующую модель...")
+                            last_error = f"Код {resp.status} ({model_path}): {err_body[:120]}"
+                            logging.warning(f"Отказ {model_path} [Ключ #{key_idx+1}]: {last_error}")
+                            if resp.status in (429, 503):
+                                await asyncio.sleep(1.0)
                 except Exception as e:
-                    last_error = f"Ошибка сети: {str(e)[:80]}"
-                    logging.warning(f"Сбой запроса {model_name}: {e}")
+                    last_error = f"Ошибка связи ({model_path}): {str(e)[:80]}"
+                    logging.warning(last_error)
 
-    raise RuntimeError(f"Не удалось получить ответ от нейросети ({last_error}). Пожалуйста, попробуйте нажать кнопку еще раз через минуту.")
+    raise RuntimeError(f"Не удалось получить ответ от нейросети.\nДетали: {last_error}")
 
 async def generate_audio_natural(text: str, file_path: str):
-    """Двойной резерв живых нейро-голосов Microsoft + аварийный gTTS."""
     voices = ["ru-RU-SvetlanaNeural", "ru-RU-DariyaNeural"]
     
     for voice in voices:
@@ -444,7 +456,7 @@ async def process_theme_and_finish(message: Message, state: FSMContext):
         async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
             story_text = await generate_story_text(child, hero, theme_text)
         
-        await message.answer(f"📖 **Сказка для {child}**\n\n{story_text}")
+        await message.answer(f"📖 Сказка для {child}\n\n{story_text}")
         
         try:
             await status_msg.edit_text("🎙 Записываю мягкий убаюкивающий голос...")
@@ -475,7 +487,7 @@ async def process_theme_and_finish(message: Message, state: FSMContext):
     except Exception as e:
         logging.error(f"Ошибка при создании сказки: {e}")
         await message.answer(
-            f"⚠️ {str(e)[:350]}\n\n(Попытка не списана с вашего баланса)", 
+            f"⚠️ {str(e)[:380]}\n\n(Попытка не списана с вашего баланса)", 
             reply_markup=main_menu_keyboard
         )
     finally:
@@ -500,20 +512,18 @@ async def start_server():
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()  # Мгновенно открываем порт для Render!
+    await site.start()
     logging.info(f"WEB SERVER SUCCESSFULLY BOUND TO PORT {port}")
     return runner
 
 async def main():
     logging.info("STARTING BOT SERVICE...")
-    # 1. Сначала мгновенно открываем порт, чтобы Render завершил старый контейнер
     server_runner = await start_server()
     init_db()
     
     keys_count = len(get_all_gemini_keys())
     logging.info(f"Загружено ключей Gemini API: {keys_count} шт.")
 
-    # 2. Ждем 4 секунды, чтобы старый экземпляр гарантированно отключился на Render
     await asyncio.sleep(4)
     
     await bot.delete_webhook(drop_pending_updates=True)

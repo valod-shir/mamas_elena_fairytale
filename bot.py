@@ -4,15 +4,20 @@ import asyncio
 import logging
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message, 
+    CallbackQuery,
     FSInputFile, 
     ReplyKeyboardMarkup, 
     KeyboardButton, 
-    ReplyKeyboardRemove
+    ReplyKeyboardRemove,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    LabeledPrice,
+    PreCheckoutQuery
 )
 from google import genai
 from google.genai import types
@@ -43,7 +48,14 @@ if GEMINI_KEY:
 
 # 2. База данных SQLite для учета пользователей и баланса
 DB_PATH = "users.db"
-FREE_START_STORIES = 2  # Сколько бесплатных сказок дается новичку
+FREE_START_STORIES = 2
+
+# Пакеты сказок: код_тарифа -> (количество_сказок, цена_в_звездах, название)
+TARIFFS = {
+    "pack_5": (5, 75, "Пакет: 5 добрых сказок"),
+    "pack_15": (15, 150, "Пакет: 15 добрых сказок"),
+    "pack_30": (30, 250, "Пакет: 30 сказок на месяц")
+}
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -74,6 +86,21 @@ def get_user_balance(user_id: int) -> int:
         balance = row[0]
     conn.close()
     return balance
+
+def add_stories_to_user(user_id: int, count: int) -> int:
+    # Убеждаемся, что пользователь есть в базе
+    _ = get_user_balance(user_id)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE users SET stories_left = stories_left + ? WHERE user_id = ?",
+        (count, user_id)
+    )
+    conn.commit()
+    c.execute("SELECT stories_left FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else count
 
 def use_one_story(user_id: int) -> int:
     conn = sqlite3.connect(DB_PATH)
@@ -123,7 +150,16 @@ theme_keyboard = ReplyKeyboardMarkup(
     one_time_keyboard=True
 )
 
-# 5. Обработчики кнопок баланса и покупки
+def get_tariffs_inline_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🌟 5 сказок — 75 ⭐️", callback_data="buy_pack_5")],
+            [InlineKeyboardButton(text="🌟 15 сказок — 150 ⭐️ (Выгодно)", callback_data="buy_pack_15")],
+            [InlineKeyboardButton(text="🌟 30 сказок — 250 ⭐️ (На месяц)", callback_data="buy_pack_30")]
+        ]
+    )
+
+# 5. Профиль, тарифы и оплата Telegram Stars
 @dp.message(F.text == "👤 Мой баланс")
 async def show_balance(message: Message):
     balance, total = get_user_stats(message.from_user.id)
@@ -131,7 +167,7 @@ async def show_balance(message: Message):
         f"👤 Ваш профиль:\n\n"
         f"🎧 Доступно сказок: {balance} шт.\n"
         f"📚 Всего создано сказок: {total} шт.\n\n"
-        f"Хотите сочинить новую сказку или пополнить баланс?"
+        f"Выберите действие в меню ниже:"
     )
     await message.answer(text, reply_markup=main_menu_keyboard)
 
@@ -140,14 +176,60 @@ async def show_tariffs(message: Message):
     balance = get_user_balance(message.from_user.id)
     text = (
         f"💎 Пополнение баланса сказок\n"
-        f"(Сейчас у вас доступно: {balance} шт.)\n\n"
-        f"Наши пакеты:\n"
-        f"🌟 5 сказок — 149 ₽ (или 75 ⭐️)\n"
-        f"🌟 15 сказок — 299 ₽ (или 150 ⭐️)\n"
-        f"🌟 30 сказок на месяц — 490 ₽ (или 250 ⭐️)\n\n"
-        f"Автоматическая оплата подключается на следующем этапе!"
+        f"Сейчас у вас доступно: {balance} шт.\n\n"
+        f"Выберите подходящий пакет для мгновенной оплаты Звёздами Telegram (⭐️):"
     )
-    await message.answer(text, reply_markup=main_menu_keyboard)
+    await message.answer(text, reply_markup=get_tariffs_inline_kb())
+
+# Секретная команда для администратора/тестирования (начисляет 5 бесплатных сказок)
+@dp.message(Command("add_free"))
+async def add_free_cmd(message: Message):
+    new_bal = add_stories_to_user(message.from_user.id, 5)
+    await message.answer(f"🎁 Тестовый бонус начислен! Ваш баланс: {new_bal} сказок.", reply_markup=main_menu_keyboard)
+
+# Нажатие на кнопку покупки пакета -> отправка счета в Stars
+@dp.callback_query(F.data.startswith("buy_"))
+async def send_stars_invoice(callback: CallbackQuery):
+    pack_key = callback.data.replace("buy_", "")
+    if pack_key not in TARIFFS:
+        await callback.answer("Тариф не найден", show_alert=True)
+        return
+
+    stories_count, stars_price, title = TARIFFS[pack_key]
+    await callback.answer()
+
+    await bot.send_invoice(
+        chat_id=callback.from_user.id,
+        title=title,
+        description=f"Пополнение баланса на {stories_count} персональных аудиосказок для малыша.",
+        payload=f"stars_{stories_count}",
+        provider_token="",  # Для Telegram Stars токен всегда пустой!
+        currency="XTR",     # XTR — официальный код Telegram Stars
+        prices=[LabeledPrice(label=title, amount=stars_price)]
+    )
+
+# Обязательное подтверждение готовности принять платеж (Pre-Checkout)
+@dp.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+# Успешная оплата -> начисление сказок в БД
+@dp.message(F.successful_payment)
+async def process_successful_payment(message: Message):
+    payload = message.successful_payment.invoice_payload
+    try:
+        stories_added = int(payload.replace("stars_", ""))
+    except Exception:
+        stories_added = 5
+
+    new_balance = add_stories_to_user(message.from_user.id, stories_added)
+    await message.answer(
+        f"🎉 Оплата прошла успешно!\n\n"
+        f"На ваш баланс зачислено: +{stories_added} сказок.\n"
+        f"🎧 Всего доступно: {new_balance} шт.\n\n"
+        f"Нажмите «🪄 Создать новую сказку», чтобы начать!",
+        reply_markup=main_menu_keyboard
+    )
 
 # 6. Старт и начало создания сказки
 @dp.message(CommandStart())
@@ -160,21 +242,18 @@ async def start_cmd(message: Message, state: FSMContext):
 
     if balance <= 0:
         no_balance_text = (
-            "🌙 Ваши бесплатные сказки закончились!\n\n"
-            "Надеемся, малышу понравились наши добрые истории. "
-            "Чтобы продолжить создавать персональные аудиосказки на каждую ночь, пополните баланс:\n\n"
-            "🌟 5 сказок — 149 ₽\n"
-            "🌟 15 сказок — 299 ₽\n"
-            "🌟 30 сказок — 490 ₽"
+            "🌙 Ваши сказки на балансе закончились!\n\n"
+            "Чтобы продолжить создавать персональные терапевтические аудиосказки для малыша, "
+            "выберите пакет пополнения ниже:"
         )
-        await message.answer(no_balance_text, reply_markup=main_menu_keyboard)
+        await message.answer(no_balance_text, reply_markup=get_tariffs_inline_kb())
         return
 
     welcome_text = (
         f"👋 Добро пожаловать в мир добрых сказок!\n"
         f"🎁 Доступно сказок на балансе: {balance} шт.\n\n"
         f"👶 Шаг 1 из 3: Напишите имя и возраст ребенка:\n"
-        f"(Например: Влада, полтора года)"
+        f"(Например: Влада, 2 года)"
     )
     await message.answer(welcome_text, reply_markup=ReplyKeyboardRemove())
     await state.set_state(StoryCreation.waiting_for_child_info)
@@ -185,7 +264,7 @@ async def process_child_info(message: Message, state: FSMContext):
     await state.update_data(child_info=message.text.strip())
     await message.answer(
         "🧸 Шаг 2 из 3: Кто любимый персонаж или игрушка малыша?\n"
-        "(Например: котенок Мау, зайчик, машинка)"
+        "(Например: котенок , зайчик, машинка)"
     )
     await state.set_state(StoryCreation.waiting_for_hero)
 
@@ -281,7 +360,10 @@ async def process_theme_and_finish(message: Message, state: FSMContext):
 
     user_id = message.from_user.id
     if get_user_balance(user_id) <= 0:
-        await message.answer("🌙 На вашем балансе закончились сказки!", reply_markup=main_menu_keyboard)
+        await message.answer(
+            "🌙 На вашем балансе закончились сказки! Пополните баланс:", 
+            reply_markup=get_tariffs_inline_kb()
+        )
         return
 
     child = data.get("child_info", "малыша")
@@ -307,8 +389,6 @@ async def process_theme_and_finish(message: Message, state: FSMContext):
         await generate_audio_fast(story_text, audio_path)
 
         voice_file = FSInputFile(audio_path)
-        
-        # Списываем 1 сказку с баланса только после успешной генерации
         remaining = use_one_story(user_id)
 
         await message.answer_voice(
@@ -325,37 +405,3 @@ async def process_theme_and_finish(message: Message, state: FSMContext):
 
     except Exception as e:
         logging.error(f"Ошибка создания сказки: {e}")
-        await message.answer(
-            f"⚠️ {str(e)[:200]}\n(Попытка не списана с вашего баланса)", 
-            reply_markup=main_menu_keyboard
-        )
-    finally:
-        if os.path.exists(audio_path):
-            try:
-                os.remove(audio_path)
-            except Exception:
-                pass
-
-# 12. Веб-сервер Render
-async def handle_ping(request):
-    return web.Response(text="OK")
-
-async def start_server():
-    app = web.Application()
-    app.router.add_get('/', handle_ping)
-    app.router.add_get('/health', handle_ping)
-    port = int(os.environ.get("PORT", 10000))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-
-async def main():
-    init_db()  # Создаем базу при запуске
-    await start_server()
-    await asyncio.sleep(2)
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())

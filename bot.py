@@ -262,7 +262,7 @@ async def process_hero(message: Message, state: FSMContext):
     )
     await state.set_state(StoryCreation.waiting_for_theme)
 
-# 7. Генерация текста сказки через Gemini с акцентом на естественность
+# 7. Генерация текста сказки через рабочую модель gemini-3.8-flash
 async def generate_story_text(child: str, hero: str, theme: str) -> str:
     global ai_client
     if not ai_client:
@@ -274,31 +274,29 @@ async def generate_story_text(child: str, hero: str, theme: str) -> str:
     prompt = (
         f"Сочини очень мягкую, успокаивающую сказку на ночь для малыша.\n"
         f"Ребенок: {child}. Любимый герой: {hero}. Тема: {theme}.\n"
-        f"Используй плавные переходы, тире и многоточия, чтобы текст звучал мелодично и неторопливо.\n"
+        f"Используй плавные переходы, тире и точки, чтобы текст звучал мелодично и неторопливо.\n"
         f"Объем строго 65-85 слов. Только чистый текст без звездочек и спецсимволов."
     )
 
-    candidate_models = ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.8-pro"]
-
-    for model_name in candidate_models:
-        for attempt in range(2):
-            try:
-                res = await asyncio.to_thread(
-                    ai_client.models.generate_content,
-                    model=model_name,
-                    contents=prompt
-                )
-                if res and res.text:
-                    return res.text.replace("*", "").replace("#", "").strip()
-            except Exception:
-                await asyncio.sleep(1.0)
+    # Используем проверенную рабочую модель 3.8-flash с повтором при нагрузке
+    for attempt in range(3):
+        try:
+            res = await asyncio.to_thread(
+                ai_client.models.generate_content,
+                model="gemini-3.8-flash",
+                contents=prompt
+            )
+            if res and res.text:
+                return res.text.replace("*", "").replace("#", "").strip()
+        except Exception as e:
+            logging.warning(f"Попытка генерации {attempt + 1} не удалась: {e}")
+            await asyncio.sleep(1.0)
 
     raise RuntimeError("Сервер нейросети перегружен. Пожалуйста, попробуйте через минуту.")
 
-# 8. Живая озвучка (медленный, мягкий темп чтения колыбельной)
+# 8. Живая озвучка (мягкий темп чтения)
 async def generate_audio_natural(text: str, file_path: str):
     try:
-        # rate="-10%" делает голос спокойным и неторопливым, pitch="+0Hz" сохраняет естественность
         communicate = edge_tts.Communicate(text, "ru-RU-SvetlanaNeural", rate="-10%")
         await asyncio.wait_for(communicate.save(file_path), timeout=5.0)
         if os.path.exists(file_path) and os.path.getsize(file_path) > 500:
@@ -306,7 +304,6 @@ async def generate_audio_natural(text: str, file_path: str):
     except Exception as e:
         logging.warning(f"edge-tts таймаут, используем плавный gTTS: {e}")
 
-    # Если сработал резерв gTTS, замедлим его через slow=True, чтобы он звучал мягче
     def run_gtts():
         tts = gTTS(text=text, lang='ru', slow=True)
         tts.save(file_path)

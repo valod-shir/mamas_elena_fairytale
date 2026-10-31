@@ -14,20 +14,12 @@ from aiogram.types import FSInputFile
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 VOICE = "ru-RU-SvetlanaNeural"
-
-# Список надежных бесплатных моделей на случай отключения одной из них
-FREE_MODELS = [
-    "google/gemini-2.0-flash-exp:free",
-    "google/gemma-2-9b-it:free",
-    "mistralai/mistral-7b-instruct:free",
-    "qwen/qwen-2.5-7b-instruct:free"
-]
 
 class StoryForm(StatesGroup):
     waiting_for_details = State()
@@ -49,54 +41,47 @@ async def generate_story(message: types.Message, state: FSMContext):
     user_prompt = message.text
     status_msg = await message.answer("✨ Сочиняю сказку...")
 
-    if not OPENROUTER_API_KEY:
-        await status_msg.edit_text("Ошибка: в настройках Render не задан OPENROUTER_API_KEY!")
+    if not GEMINI_API_KEY:
+        await status_msg.edit_text("Ошибка: в настройках Render не задан GEMINI_API_KEY!")
         await state.clear()
         return
 
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {OPENROUTER_API_KEY.strip()}",
-        "HTTP-Referer": "https://render.com",
-        "X-Title": "Fairytale Bot"
+    # Запрос к официальному бесплатному API Google Gemini
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY.strip()}"
+    headers = {"Content-Type": "application/json"}
+    
+    prompt = (
+        "Ты детский писатель-сказкотерапевт. Напиши добрую, нежную и короткую терапевтическую сказку "
+        "для малыша на русском языке на основе пожелания: "
+        f"{user_prompt}\n\n"
+        "Требования: объем около 150-200 слов. Используй только простой связный текст без звездочек (*), "
+        "решеток (#), кавычек и форматирования, так как текст пойдет прямо в аудио-озвучку."
+    )
+
+    payload = {
+        "contents": [
+            {
+                "parts": [{"text": prompt}]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.7
+        }
     }
 
-    story_text = None
-    last_error = ""
-
-    # Пробуем по очереди бесплатные модели из списка
-    async with aiohttp.ClientSession() as session:
-        for model_name in FREE_MODELS:
-            payload = {
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "Ты детский писатель. Напиши короткую добрую сказку на ночь на русском языке. "
-                            "Объем: 150 слов. Не используй спецсимволы, звездочки и форматирование, "
-                            "так как текст идет в аудио-озвучку."
-                        )
-                    },
-                    {"role": "user", "content": user_prompt}
-                ],
-                "model": model_name,
-                "temperature": 0.7
-            }
-
-            try:
-                async with session.post(url, headers=headers, json=payload) as resp:
-                    data = await resp.json()
-                    if "choices" in data and len(data["choices"]) > 0:
-                        story_text = data["choices"][0]["message"]["content"]
-                        break
-                    else:
-                        last_error = str(data.get("error", data))
-            except Exception as e:
-                last_error = str(e)
-
-    if not story_text:
-        await status_msg.edit_text(f"Ошибка всех моделей OpenRouter: {last_error[:300]}")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                data = await resp.json()
+                if "candidates" in data and len(data["candidates"]) > 0:
+                    story_text = data["candidates"][0]["content"]["parts"][0]["text"]
+                else:
+                    err_msg = str(data.get("error", data))
+                    await status_msg.edit_text(f"Ответ Gemini: {err_msg[:300]}")
+                    await state.clear()
+                    return
+    except Exception as e:
+        await status_msg.edit_text(f"Ошибка запроса: {e}")
         await state.clear()
         return
 
@@ -109,10 +94,10 @@ async def generate_story(message: types.Message, state: FSMContext):
         await communicate.save(audio_path)
 
         audio_file = FSInputFile(audio_path)
-        await message.answer_audio(audio_file, caption="🎧 Твоя персональная сказка")
+        await message.answer_audio(audio_file, caption="🎧 Персональная сказка")
         await audio_status.delete()
     except Exception as e:
-        await audio_status.edit_text("Сказка готова текстом, но аудиофайл записать не удалось.")
+        await audio_status.edit_text("Сказка готова текстом выше, но файл озвучки сохранить не удалось.")
     finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)

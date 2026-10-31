@@ -1,47 +1,31 @@
 import os
-import sys
-import logging
-import threading
 import asyncio
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from telebot.async_telebot import AsyncTeleBot
+import logging
+from aiohttp import web
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
+from aiogram.types import Message, FSInputFile
 from google import genai
-from gtts import gTTS
+import edge_tts
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
-# 1. Запуск мини веб-сервера для Render (устраняет ошибку "No open ports detected")
-class RenderHealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK")
+# 1. Получение ключей
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("BOT_TOKEN")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 
-    def log_message(self, format, *args):
-        return  # Не засоряем логи фоновыми проверками Render
+if not BOT_TOKEN:
+    logging.error("ВНИМАНИЕ: Не найден токен бота в переменных окружения!")
+if not GEMINI_KEY:
+    logging.error("ВНИМАНИЕ: Не найден GEMINI_API_KEY в переменных окружения!")
 
-def run_background_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), RenderHealthCheckHandler)
-    server.serve_forever()
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+ai_client = genai.Client(api_key=GEMINI_KEY)
 
-threading.Thread(target=run_background_web_server, daemon=True).start()
-
-# 2. Инициализация токенов и клиентов
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
-    logging.error("ВНИМАНИЕ: Не заданы переменные TELEGRAM_BOT_TOKEN или GEMINI_API_KEY в Render Environment!")
-
-bot = AsyncTeleBot(TELEGRAM_BOT_TOKEN)
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
-
-# 3. Обработчик команды /start
-@bot.message_handler(commands=['start'])
-async def send_welcome(message):
+# 2. Обработчик команды /start
+@dp.message(CommandStart())
+async def start_cmd(message: Message):
     welcome_text = (
         "👋 Привет! Я создаю персональные аудиосказки для детей.\n\n"
         "Напиши мне:\n"
@@ -50,76 +34,77 @@ async def send_welcome(message):
         "3. Какую проблему решить или тему сказки\n\n"
         "✍️ Отправь всё одним сообщением:"
     )
-    await bot.reply_to(message, welcome_text)
+    await message.answer(welcome_text)
 
-# Вспомогательная функция для синхронного сохранения аудио через gTTS
-def generate_audio_file(text: str, filename: str):
-    tts = gTTS(text=text, lang='ru', slow=False)
-    tts.save(filename)
+# 3. Обработчик текста для сказки
+@dp.message(F.text)
+async def generate_story_handler(message: Message):
+    status_msg = await message.answer("✨ Сочиняю сказку...")
+    audio_path = f"story_{message.chat.id}_{message.message_id}.mp3"
 
-# 4. Основной обработчик создания сказки
-@bot.message_handler(func=lambda message: True)
-async def generate_fairytale(message):
-    status_msg = await bot.reply_to(message, "✨ Сочиняю сказку...")
-    
     try:
         # Промпт для Gemini
         prompt = (
             "Ты добрый сказочник для малышей. Сочини короткую, терапевтическую, "
-            "успокаивающую и добрую сказку на ночь на основе следующего запроса:\n\n"
+            "успокаивающую сказку на ночь на основе запроса:\n\n"
             f"{message.text}\n\n"
-            "Требования к сказке:\n"
-            "- Простой, плавный и мелодичный язык для маленького ребенка.\n"
-            "- Длина примерно 150-200 слов.\n"
-            "- Без markdown-разметки (без звездочек, решеток и спецсимволов), чтобы текст идеально читался озвучкой."
+            "Требования: простой и ласковый язык для ребенка, объем 150-200 слов, "
+            "без markdown-разметки (без звездочек *, решеток # и прочих знаков), чтобы озвучка читала гладко."
         )
 
-        # Генерация текста сказки через Gemini
+        # Генерация текста через Gemini
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
             model="gemini-2.5-flash",
             contents=prompt
         )
         story_text = response.text.strip()
-        
-        # Отправляем готовый текст в чат
-        await bot.send_message(message.chat.id, story_text)
-        await bot.edit_message_text("🎙 Записываю озвучку...", chat_id=message.chat.id, message_id=status_msg.message_id)
 
-        # Имя временного аудиофайла
-        audio_file_path = f"story_{message.chat.id}_{message.message_id}.mp3"
-        
+        # Отправляем текст сказки в чат
+        await message.answer(story_text)
+        await status_msg.edit_text("🎙 Записываю озвучку...")
+
+        # Генерация аудио через Edge TTS (голос Светланы - мягкий женский)
         try:
-            # Озвучиваем текст в отдельном потоке, чтобы не блокировать бота
-            await asyncio.to_thread(generate_audio_file, story_text, audio_file_path)
-            
-            # Отправляем аудиофайл в Telegram
-            with open(audio_file_path, 'rb') as audio:
-                await bot.send_audio(
-                    message.chat.id, 
-                    audio, 
-                    title="Добрая сказка на ночь", 
-                    performer="Сказки для малышей",
-                    caption="🎧 Приятного прослушивания!"
-                )
-                
-            await bot.delete_message(chat_id=message.chat.id, message_id=status_msg.message_id)
+            communicate = edge_tts.Communicate(story_text, "ru-RU-SvetlanaNeural")
+            await communicate.save(audio_path)
+
+            voice_file = FSInputFile(audio_path)
+            await message.answer_voice(voice=voice_file, caption="🎧 Приятного прослушивания!")
+            await status_msg.delete()
 
         except Exception as e:
-            logging.error(f"Ошибка при создании аудио: {e}")
-            await bot.send_message(
-                message.chat.id, 
-                "Сказка готова текстом выше, но файл озвучки сохранить не удалось."
-            )
+            logging.error(f"Ошибка Edge TTS: {e}")
+            await message.answer("Сказка готова текстом выше, но файл озвучки сохранить не удалось.")
         finally:
-            # Удаляем временный файл с диска
-            if os.path.exists(audio_file_path):
-                os.remove(audio_file_path)
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
 
     except Exception as e:
-        logging.error(f"Общая ошибка генератора: {e}")
-        await bot.send_message(message.chat.id, "Произошла ошибка при сочинении сказки. Попробуйте еще раз.")
+        logging.error(f"Ошибка Gemini: {e}")
+        await message.answer("Произошла ошибка при создании сказки. Попробуйте еще раз.")
 
-# 5. Точка входа
+# 4. Веб-сервер для прохождения проверки порта Render
+async def handle_ping(request):
+    return web.Response(text="Bot is running")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    app.router.add_get('/health', handle_ping)
+    
+    port = int(os.environ.get("PORT", 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logging.info(f"Веб-сервер запущен на порту {port}")
+
+# 5. Главная функция одновременного запуска
+async def main():
+    # Запускаем одновременно веб-сервер для Render и polling бота
+    await start_web_server()
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
-    asyncio.run(bot.polling(non_stop=True))
+    asyncio.run(main())

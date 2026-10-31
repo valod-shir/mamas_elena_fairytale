@@ -1,7 +1,6 @@
 import os
 import asyncio
 import logging
-import time
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -15,40 +14,32 @@ from aiogram.types import (
     ReplyKeyboardRemove
 )
 from google import genai
+import edge_tts
 from gtts import gTTS
 
 logging.basicConfig(level=logging.INFO)
 
-# 1. Считываем ключи
-raw_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("BOT_TOKEN") or ""
-raw_gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
-
-BOT_TOKEN = raw_bot_token.strip().strip("'").strip('"')
-GEMINI_KEY = raw_gemini_key.strip().strip("'").strip('"')
+# Чтение переменных окружения
+BOT_TOKEN = (os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("BOT_TOKEN") or "").strip().strip("'\"")
+GEMINI_KEY = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip().strip("'\"")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-ai_client = None
-if GEMINI_KEY:
-    try:
-        ai_client = genai.Client(api_key=GEMINI_KEY)
-    except Exception as e:
-        logging.error(f"Ошибка инициализации Gemini: {e}")
+# Инициализируем клиент
+ai_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 
-# 2. FSM состояния
 class StoryCreation(StatesGroup):
     waiting_for_child_info = State()
     waiting_for_hero = State()
     waiting_for_theme = State()
     waiting_for_voice = State()
 
-# 3. Клавиатуры
 theme_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="😴 На крепкий сон"), KeyboardButton(text="🥣 Хороший аппетит")],
         [KeyboardButton(text="🧸 Делиться игрушками"), KeyboardButton(text="🦷 Чистить зубки")],
-        [KeyboardButton(text="✍️ Написать свою тему")]
+        [KeyboardButton(text="✍️ Своя тема")]
     ],
     resize_keyboard=True,
     one_time_keyboard=True
@@ -56,160 +47,156 @@ theme_keyboard = ReplyKeyboardMarkup(
 
 voice_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="👩 Голос мамы (нежный)")],
-        [KeyboardButton(text="👨 Голос папы (спокойный)")]
+        [KeyboardButton(text="👩 Голос мамы (Светлана)")],
+        [KeyboardButton(text="👨 Голос папы (Дмитрий)")]
     ],
     resize_keyboard=True,
     one_time_keyboard=True
 )
 
-# 4. Команда /start
 @dp.message(CommandStart())
 async def start_cmd(message: Message, state: FSMContext):
     await state.clear()
     welcome_text = (
-        "👋 Добро пожаловать в мир добрых сказок!\n\n"
-        "Я помогу создать персональную терапевтическую аудиосказку для вашего малыша.\n\n"
-        "👶 Шаг 1 из 4: Напишите имя и возраст ребенка.\n"
-        "(Например: Влада, полтора года)"
+        "👋 **Добро пожаловать в мир добрых сказок!**\n\n"
+        "Я создаю персональные аудиосказки для детей за 10 секунд.\n\n"
+        "👶 **Шаг 1 из 4:** Напишите имя и возраст ребенка:\n"
+        "*(Например: Влада, полтора года)*"
     )
-    await message.answer(welcome_text, reply_markup=ReplyKeyboardRemove())
+    await message.answer(welcome_text, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
     await state.set_state(StoryCreation.waiting_for_child_info)
 
-# 5. Шаг 1: Имя и возраст
 @dp.message(StoryCreation.waiting_for_child_info, F.text)
 async def process_child_info(message: Message, state: FSMContext):
     await state.update_data(child_info=message.text.strip())
     await message.answer(
-        "🧸 Шаг 2 из 4: Кто любимый герой или игрушка малыша?\n"
-        "(Например: плюшевый котенок Мау, машинка, зайчик)"
+        "🧸 **Шаг 2 из 4:** Кто любимый персонаж или игрушка малыша?\n"
+        "*(Например: котенок Мау, зайчик, синий трактор)*",
+        parse_mode="Markdown"
     )
     await state.set_state(StoryCreation.waiting_for_hero)
 
-# 6. Шаг 2: Герой
 @dp.message(StoryCreation.waiting_for_hero, F.text)
 async def process_hero(message: Message, state: FSMContext):
     await state.update_data(hero=message.text.strip())
     await message.answer(
-        "🎯 Шаг 3 из 4: Выберите тему сказки или напишите свою:",
+        "🎯 **Шаг 3 из 4:** Выберите тему сказки:",
         reply_markup=theme_keyboard
     )
     await state.set_state(StoryCreation.waiting_for_theme)
 
-# 7. Шаг 3: Тема
 @dp.message(StoryCreation.waiting_for_theme, F.text)
 async def process_theme(message: Message, state: FSMContext):
-    theme_text = message.text.strip()
-    if theme_text == "✍️ Написать свою тему":
+    text = message.text.strip()
+    if text == "✍️ Своя тема":
         await message.answer("Напишите кратко, о чем должна быть сказка:")
         return
 
-    await state.update_data(theme=theme_text)
+    await state.update_data(theme=text)
     await message.answer(
-        "🎙 Шаг 4 из 4: Каким голосом озвучить сказку?",
+        "🎙 **Шаг 4 из 4:** Выберите голос для озвучки:",
         reply_markup=voice_keyboard
     )
     await state.set_state(StoryCreation.waiting_for_voice)
 
-# Надежная генерация с 3 попытками и возвратом точной ошибки
-def generate_story_sync(child_info: str, hero: str, theme: str) -> str:
+# 1. Сверхбыстрая асинхронная генерация Gemini с таймаутом
+async def generate_story_async(child: str, hero: str, theme: str) -> str:
     if not ai_client:
-        raise ValueError("GEMINI_API_KEY не задан в Render Environment")
+        raise ValueError("GEMINI_API_KEY не задан")
 
-    system_instruction = (
-        "Ты добрый сказочник для малышей. Сочини короткую, терапевтическую, "
-        "успокаивающую сказку на ночь на основе запроса пользователя. "
-        "Язык ласковый и понятный, объем 110-150 слов. "
-        "Пиши чистым текстом БЕЗ спецсимволов markdown (*, #, _), чтобы диктор читал ровно."
+    prompt = (
+        f"Ты детский сказочник. Сочини короткую, нежную терапевтическую сказку на ночь.\n"
+        f"Ребенок: {child}. Герой: {hero}. Тема: {theme}.\n"
+        f"ОБЪЕМ: строго 70-90 слов. Предложения короткие и простые. "
+        f"БЕЗ символов форматирования (*, #, _), только чистый текст для диктора."
     )
-    user_prompt = f"Ребенок: {child_info}\nГерой: {hero}\nТема: {theme}"
-    full_prompt = f"{system_instruction}\n\nЗапрос:\n{user_prompt}"
 
-    last_error = None
-    # 3 попытки с интервалом 2 секунды на случай кратковременной загрузки 503
-    for attempt in range(1, 4):
-        try:
-            res = ai_client.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=full_prompt
-            )
-            if res and res.text:
-                return res.text.strip()
-        except Exception as e:
-            last_error = e
-            logging.warning(f"Попытка {attempt} завершилась с ошибкой: {e}")
-            time.sleep(2)
+    # Используем асинхронный клиент ai_client.aio с лимитом 12 секунд
+    response = await asyncio.wait_for(
+        ai_client.aio.models.generate_content(
+            model="gemini-3.8-flash",
+            contents=prompt
+        ),
+        timeout=12.0
+    )
+    return response.text.strip()
 
-    raise RuntimeError(f"{last_error}")
+# 2. Быстрая озвучка с мужским/женским голосом
+async def generate_speech_async(text: str, voice_str: str, file_path: str):
+    is_male = ("Дмитрий" in voice_str or "папы" in voice_str)
+    voice_name = "ru-RU-DmitryNeural" if is_male else "ru-RU-SvetlanaNeural"
 
-# Озвучка Google TTS
-def generate_audio_sync(text: str, filename: str):
-    tts = gTTS(text=text, lang='ru', slow=False)
-    tts.save(filename)
+    try:
+        # Пробуем Edge-TTS с таймаутом 10 секунд
+        communicate = edge_tts.Communicate(text, voice_name)
+        await asyncio.wait_for(communicate.save(file_path), timeout=10.0)
+    except Exception as e:
+        logging.warning(f"Edge TTS не ответил вовремя ({e}), быстрый резерв gTTS...")
+        # Резерв gTTS через отдельный поток
+        def run_gtts():
+            tts = gTTS(text=text, lang='ru', slow=False)
+            tts.save(file_path)
+        await asyncio.to_thread(run_gtts)
 
-# 8. Шаг 4: Генерация и отправка
 @dp.message(StoryCreation.waiting_for_voice, F.text)
-async def process_voice_and_generate(message: Message, state: FSMContext):
+async def process_voice_and_finish(message: Message, state: FSMContext):
+    voice_choice = message.text.strip()
     data = await state.get_data()
     await state.clear()
 
     child = data.get("child_info", "малыша")
     hero = data.get("hero", "героя")
-    theme = data.get("theme", "добрую тему")
+    theme = data.get("theme", "сон")
 
-    status_msg = await message.answer(
-        "✨ Волшебство начинается! Сочиняю сказку...", 
-        reply_markup=ReplyKeyboardRemove()
-    )
+    status_msg = await message.answer("✨ Сочиняю сказку...", reply_markup=ReplyKeyboardRemove())
     audio_path = f"story_{message.chat.id}_{message.message_id}.mp3"
 
     try:
-        # 1. Текст сказки
-        story_text = await asyncio.to_thread(generate_story_sync, child, hero, theme)
-        await message.answer(f"📖 Сказка для {child}\n\n{story_text}")
+        # Шаг 1: Текст (2-4 секунды)
+        story_text = await generate_story_async(child, hero, theme)
+        await message.answer(f"📖 **Сказка для {child}**\n\n{story_text}", parse_mode="Markdown")
         
         try:
-            await status_msg.edit_text("🎙 Записываю сказку голосом...")
+            await status_msg.edit_text("🎙 Озвучиваю сказку...")
         except Exception:
             pass
 
-        # 2. Озвучка через gTTS
-        try:
-            await asyncio.to_thread(generate_audio_sync, story_text, audio_path)
+        # Шаг 2: Аудио (2-5 секунд)
+        await generate_speech_async(story_text, voice_choice, audio_path)
 
-            voice_file = FSInputFile(audio_path)
-            await message.answer_voice(
-                voice=voice_file, 
-                caption=f"🎧 Сказка про {hero} готова!\nСладких снов малышу ✨"
-            )
-            
+        voice_file = FSInputFile(audio_path)
+        is_male = ("Дмитрий" in voice_choice or "папы" in voice_choice)
+        voice_label = "папы Дмитрия" if is_male else "мамы Светланы"
+
+        await message.answer_voice(
+            voice=voice_file, 
+            caption=f"🎧 Сказка про {hero}\nОзвучено голосом {voice_label} ✨"
+        )
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+        next_kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="/start 🪄 Создать новую сказку")]],
+            resize_keyboard=True
+        )
+        await message.answer("Хотите сочинить еще одну сказку?", reply_markup=next_kb)
+
+    except asyncio.TimeoutError:
+        await message.answer("⚠️ Сервер нейросети отвечал слишком долго. Пожалуйста, нажмите /start и попробуйте еще раз.")
+    except Exception as e:
+        logging.error(f"Ошибка создания сказки: {e}")
+        await message.answer(f"⚠️ Ошибка создания: {str(e)[:150]}")
+    finally:
+        if os.path.exists(audio_path):
             try:
-                await status_msg.delete()
+                os.remove(audio_path)
             except Exception:
                 pass
 
-            new_btn = ReplyKeyboardMarkup(
-                keyboard=[[KeyboardButton(text="/start 🪄 Создать новую сказку")]],
-                resize_keyboard=True
-            )
-            await message.answer("Хотите сочинить еще одну сказку?", reply_markup=new_btn)
-
-        except Exception as tts_err:
-            logging.error(f"Ошибка озвучки: {tts_err}")
-            await message.answer(f"Сказка готова текстом выше, но файл озвучки сохранить не удалось.")
-        finally:
-            if os.path.exists(audio_path):
-                try:
-                    os.remove(audio_path)
-                except Exception:
-                    pass
-
-    except Exception as e:
-        error_details = str(e)
-        logging.error(f"Ошибка создания сказки: {error_details}")
-        await message.answer(f"⚠️ Ошибка создания сказки:\n{error_details[:300]}")
-
-# 9. Фоновый веб-сервер для Render
+# Веб-сервер Render
 async def handle_ping(request):
     return web.Response(text="OK")
 

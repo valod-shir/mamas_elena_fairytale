@@ -14,10 +14,7 @@ from aiogram.types import FSInputFile
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не задан в переменных окружения!")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -44,24 +41,27 @@ async def generate_story(message: types.Message, state: FSMContext):
     user_prompt = message.text
     status_msg = await message.answer("✨ Сочиняю сказку...")
 
-    url = "https://models.inference.ai.azure.com/chat/completions"
+    url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {GITHUB_TOKEN}"
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "HTTP-Referer": "https://render.com",
+        "X-Title": "Fairytale Bot"
     }
     payload = {
         "messages": [
             {
                 "role": "system",
                 "content": (
-                    "Ты профессиональный детский писатель-сказкотерапевт. "
-                    "Напиши короткую добрую сказку на ночь на основе запроса (200-250 слов). "
-                    "Не используй спецсимволы, звездочки или разметку, так как текст идет в озвучку."
+                    "Ты детский писатель. Напиши добрую, поучительную и нежную сказку на русском языке для ребенка. "
+                    "Объем: 150-200 слов. "
+                    "Используй только обычный текст без звездочек (*), решеток (#), кавычек-елочек и спецсимволов, "
+                    "так как весь текст сразу пойдет в голосовую озвучку."
                 )
             },
             {"role": "user", "content": user_prompt}
         ],
-        "model": "gpt-4o-mini",
+        "model": "meta-llama/llama-3.1-8b-instruct:free",
         "temperature": 0.7
     }
 
@@ -71,7 +71,7 @@ async def generate_story(message: types.Message, state: FSMContext):
                 data = await resp.json()
                 story_text = data["choices"][0]["message"]["content"]
     except Exception as e:
-        await status_msg.edit_text("Не удалось получить текст от ИИ. Проверь GITHUB_TOKEN.")
+        await status_msg.edit_text("Не удалось сгенерировать текст через OpenRouter. Проверь баланс/ключ.")
         await state.clear()
         return
 
@@ -87,13 +87,12 @@ async def generate_story(message: types.Message, state: FSMContext):
         await message.answer_audio(audio_file, caption="🎧 Персональная сказка")
         await audio_status.delete()
     except Exception as e:
-        await audio_status.edit_text("Сказка готова текстом выше, но озвучка не удалась.")
+        await audio_status.edit_text("Сказка готова текстом выше, но озвучить не удалось.")
     finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)
         await state.clear()
 
-# Микро-сервер для удовлетворения проверок Render
 async def handle_ping(request):
     return web.Response(text="Bot is running")
 
@@ -112,4 +111,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-

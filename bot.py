@@ -21,6 +21,14 @@ dp = Dispatcher()
 
 VOICE = "ru-RU-SvetlanaNeural"
 
+# Список надежных бесплатных моделей на случай отключения одной из них
+FREE_MODELS = [
+    "google/gemini-2.0-flash-exp:free",
+    "google/gemma-2-9b-it:free",
+    "mistralai/mistral-7b-instruct:free",
+    "qwen/qwen-2.5-7b-instruct:free"
+]
+
 class StoryForm(StatesGroup):
     waiting_for_details = State()
 
@@ -53,34 +61,42 @@ async def generate_story(message: types.Message, state: FSMContext):
         "HTTP-Referer": "https://render.com",
         "X-Title": "Fairytale Bot"
     }
-    payload = {
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Ты детский писатель. Напиши добрую, короткую сказку на ночь на русском языке. "
-                    "Объем: 150 слов. Без звездочек, решеток и спецсимволов."
-                )
-            },
-            {"role": "user", "content": user_prompt}
-        ],
-        "model": "meta-llama/llama-3.3-70b-instruct:free",
-        "temperature": 0.7
-    }
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=payload) as resp:
-                data = await resp.json()
-                if "choices" in data and len(data["choices"]) > 0:
-                    story_text = data["choices"][0]["message"]["content"]
-                else:
-                    err_msg = str(data.get("error", data))
-                    await status_msg.edit_text(f"Ответ OpenRouter: {err_msg[:300]}")
-                    await state.clear()
-                    return
-    except Exception as e:
-        await status_msg.edit_text(f"Ошибка запроса: {e}")
+    story_text = None
+    last_error = ""
+
+    # Пробуем по очереди бесплатные модели из списка
+    async with aiohttp.ClientSession() as session:
+        for model_name in FREE_MODELS:
+            payload = {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Ты детский писатель. Напиши короткую добрую сказку на ночь на русском языке. "
+                            "Объем: 150 слов. Не используй спецсимволы, звездочки и форматирование, "
+                            "так как текст идет в аудио-озвучку."
+                        )
+                    },
+                    {"role": "user", "content": user_prompt}
+                ],
+                "model": model_name,
+                "temperature": 0.7
+            }
+
+            try:
+                async with session.post(url, headers=headers, json=payload) as resp:
+                    data = await resp.json()
+                    if "choices" in data and len(data["choices"]) > 0:
+                        story_text = data["choices"][0]["message"]["content"]
+                        break
+                    else:
+                        last_error = str(data.get("error", data))
+            except Exception as e:
+                last_error = str(e)
+
+    if not story_text:
+        await status_msg.edit_text(f"Ошибка всех моделей OpenRouter: {last_error[:300]}")
         await state.clear()
         return
 
@@ -93,10 +109,10 @@ async def generate_story(message: types.Message, state: FSMContext):
         await communicate.save(audio_path)
 
         audio_file = FSInputFile(audio_path)
-        await message.answer_audio(audio_file, caption="🎧 Персональная сказка")
+        await message.answer_audio(audio_file, caption="🎧 Твоя персональная сказка")
         await audio_status.delete()
     except Exception as e:
-        await audio_status.edit_text("Сказка готова текстом, но озвучить не получилось.")
+        await audio_status.edit_text("Сказка готова текстом, но аудиофайл записать не удалось.")
     finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)
@@ -120,4 +136,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    

@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import sqlite3
 import asyncio
 import logging
@@ -21,22 +22,54 @@ from aiogram.types import (
     LabeledPrice,
     PreCheckoutQuery
 )
+from aiogram.utils.chat_action import ChatActionSender
 import edge_tts
 from gtts import gTTS
 
-logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout
+)
 
 # ==========================================
-# 1. НАСТРОЙКИ И КЛЮЧИ
+# 1. НАСТРОЙКИ, КЛЮЧИ И ЗАЩИТА ОТ ДУБЛЕЙ
 # ==========================================
 raw_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("BOT_TOKEN") or ""
 BOT_TOKEN = raw_bot_token.strip().strip("'\"")
 
+if not BOT_TOKEN:
+    logging.critical("КРИТИЧЕСКАЯ ОШИБКА: Не задан TELEGRAM_BOT_TOKEN!")
+    sys.exit(1)
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# Защита от двойного нажатия во время генерации
+active_generations = set()
+# Индекс последнего успешного ключа для равномерного распределения нагрузки
+current_key_index = 0
+
+def get_all_gemini_keys() -> list[str]:
+    """Собирает все доступные ключи из переменных окружения Render."""
+    keys = []
+    candidates = [
+        "GEMINI_API_KEY", "GOOGLE_API_KEY",
+        "GEMINI_API_KEY_1", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3",
+        "GEMINI_API_KEY_4", "GEMINI_API_KEY_5"
+    ]
+    for var_name in candidates:
+        val = os.environ.get(var_name, "")
+        if val:
+            # Поддержка передачи нескольких ключей через запятую в одной переменной
+            for part in val.split(","):
+                clean_k = part.strip().strip("'\"")
+                if clean_k and clean_k not in keys:
+                    keys.append(clean_k)
+    return keys
+
 # ==========================================
-# 2. БАЗА ДАННЫХ И ТАРИФЫ
+# 2. НАДЕЖНАЯ БАЗА ДАННЫХ SQLite (WAL-режим)
 # ==========================================
 DB_PATH = "/tmp/users.db" if os.path.exists("/tmp") else "users.db"
 FREE_START_STORIES = 2
@@ -47,68 +80,65 @@ TARIFFS = {
     "pack_30": (30, 250, "Пакет: 30 сказок на месяц")
 }
 
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            stories_left INTEGER DEFAULT 2,
-            total_generated INTEGER DEFAULT 0
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    with get_db_connection() as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                stories_left INTEGER DEFAULT 2,
+                total_generated INTEGER DEFAULT 0
+            )
+        ''')
+        conn.commit()
 
 def get_user_balance(user_id: int) -> int:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT stories_left FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    if row is None:
-        c.execute(
-            "INSERT INTO users (user_id, stories_left, total_generated) VALUES (?, ?, 0)",
-            (user_id, FREE_START_STORIES)
-        )
-        conn.commit()
-        balance = FREE_START_STORIES
-    else:
-        balance = row[0]
-    conn.close()
-    return balance
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT stories_left FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        if row is None:
+            c.execute(
+                "INSERT INTO users (user_id, stories_left, total_generated) VALUES (?, ?, 0)",
+                (user_id, FREE_START_STORIES)
+            )
+            conn.commit()
+            return FREE_START_STORIES
+        return row[0]
 
 def add_stories_to_user(user_id: int, count: int) -> int:
     _ = get_user_balance(user_id)
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE users SET stories_left = stories_left + ? WHERE user_id = ?", (count, user_id))
-    conn.commit()
-    c.execute("SELECT stories_left FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else count
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE users SET stories_left = stories_left + ? WHERE user_id = ?", (count, user_id))
+        conn.commit()
+        c.execute("SELECT stories_left FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        return row[0] if row else count
 
 def use_one_story(user_id: int) -> int:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "UPDATE users SET stories_left = MAX(0, stories_left - 1), total_generated = total_generated + 1 WHERE user_id = ?",
-        (user_id,)
-    )
-    conn.commit()
-    c.execute("SELECT stories_left FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else 0
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE users SET stories_left = MAX(0, stories_left - 1), total_generated = total_generated + 1 WHERE user_id = ?",
+            (user_id,)
+        )
+        conn.commit()
+        c.execute("SELECT stories_left FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        return row[0] if row else 0
 
 def get_user_stats(user_id: int):
     balance = get_user_balance(user_id)
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT total_generated FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    total = row[0] if row else 0
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT total_generated FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        total = row[0] if row else 0
     return balance, total
 
 # ==========================================
@@ -131,7 +161,7 @@ theme_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="😴 На крепкий сон"), KeyboardButton(text="🥣 Хороший аппетит")],
         [KeyboardButton(text="🧸 Делиться игрушками"), KeyboardButton(text="🦷 Чистить зубки")],
-        [KeyboardButton(text="✍️ Своя тема")]
+        [KeyboardButton(text="✍️ Своя тема"), KeyboardButton(text="🏠 В главное меню")]
     ],
     resize_keyboard=True,
     one_time_keyboard=True
@@ -147,13 +177,22 @@ def get_tariffs_inline_kb() -> InlineKeyboardMarkup:
     )
 
 # ==========================================
-# 4. ОБРАБОТЧИКИ ОПЛАТЫ И ПРОФИЛЯ
+# 4. ОБРАБОТЧИКИ ПРОФИЛЯ И ОПЛАТЫ
 # ==========================================
+@dp.message(F.text == "🏠 В главное меню")
+@dp.message(Command("cancel"))
+async def cancel_to_menu(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Вы вернулись в главное меню:", reply_markup=main_menu_keyboard)
+
 @dp.message(F.text == "👤 Мой баланс")
 async def show_balance(message: Message):
     balance, total = get_user_stats(message.from_user.id)
     await message.answer(
-        f"👤 Ваш профиль:\n\n🎧 Доступно сказок: {balance} шт.\n📚 Всего создано сказок: {total} шт.\n\nВыберите действие в меню ниже:",
+        f"👤 Ваш профиль:\n\n"
+        f"🎧 Доступно сказок: {balance} шт.\n"
+        f"📚 Всего создано сказок: {total} шт.\n\n"
+        f"Выберите действие в меню ниже:",
         reply_markup=main_menu_keyboard
     )
 
@@ -161,9 +200,16 @@ async def show_balance(message: Message):
 async def show_tariffs(message: Message):
     balance = get_user_balance(message.from_user.id)
     await message.answer(
-        f"💎 Пополнение баланса сказок\nСейчас у вас доступно: {balance} шт.\n\nВыберите пакет для мгновенной оплаты Звёздами (⭐️):",
+        f"💎 Пополнение баланса сказок\n"
+        f"Сейчас у вас доступно: {balance} шт.\n\n"
+        f"Выберите пакет для мгновенной оплаты Звёздами Telegram (⭐️):",
         reply_markup=get_tariffs_inline_kb()
     )
+
+@dp.message(Command("add_free"))
+async def add_free_cmd(message: Message):
+    new_bal = add_stories_to_user(message.from_user.id, 5)
+    await message.answer(f"🎁 Бонус начислен! Ваш баланс: {new_bal} сказок.", reply_markup=main_menu_keyboard)
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def send_stars_invoice(callback: CallbackQuery):
@@ -198,12 +244,15 @@ async def process_successful_payment(message: Message):
 
     new_balance = add_stories_to_user(message.from_user.id, stories_added)
     await message.answer(
-        f"🎉 Оплата прошла успешно!\n\nНа ваш баланс зачислено: +{stories_added} сказок.\n🎧 Всего доступно: {new_balance} шт.\n\nНажмите «🪄 Создать новую сказку», чтобы начать!",
+        f"🎉 Оплата прошла успешно!\n\n"
+        f"На ваш баланс зачислено: +{stories_added} сказок.\n"
+        f"🎧 Всего доступно: {new_balance} шт.\n\n"
+        f"Нажмите «🪄 Создать новую сказку», чтобы начать!",
         reply_markup=main_menu_keyboard
     )
 
 # ==========================================
-# 5. ДИАЛОГ СОЗДАНИЯ СКАЗКИ
+# 5. ШАГИ СОЗДАНИЯ СКАЗКИ
 # ==========================================
 @dp.message(CommandStart())
 @dp.message(F.text.startswith("/start"))
@@ -215,13 +264,17 @@ async def start_cmd(message: Message, state: FSMContext):
 
     if balance <= 0:
         await message.answer(
-            "🌙 Ваши сказки на балансе закончились!\n\nЧтобы продолжить, выберите пакет пополнения ниже:",
+            "🌙 Ваши сказки на балансе закончились!\n\n"
+            "Чтобы продолжить создавать персональные аудиосказки для малыша, выберите пакет пополнения ниже:",
             reply_markup=get_tariffs_inline_kb()
         )
         return
 
     await message.answer(
-        f"👋 Добро пожаловать!\n🎁 Доступно сказок: {balance} шт.\n\n👶 Шаг 1 из 3: Напишите имя и возраст ребенка:\n(Например: Влада, 3 года)",
+        f"👋 Добро пожаловать в мир добрых сказок!\n"
+        f"🎁 Доступно сказок на балансе: {balance} шт.\n\n"
+        f"👶 Шаг 1 из 3: Напишите имя и возраст ребенка:\n"
+        f"(Например: Влада, 3 года)",
         reply_markup=ReplyKeyboardRemove()
     )
     await state.set_state(StoryCreation.waiting_for_child_info)
@@ -230,147 +283,214 @@ async def start_cmd(message: Message, state: FSMContext):
 async def process_child_info(message: Message, state: FSMContext):
     await state.update_data(child_info=message.text.strip())
     await message.answer(
-        "🧸 Шаг 2 из 3: Кто любимый персонаж или игрушка малыша?\n(Например: котенок, зайчик Снежок, машинка)",
+        "🧸 Шаг 2 из 3: Кто любимый персонаж или игрушка малыша?\n"
+        "(Например: котенок Мау, зайчик Снежок, машинка)"
     )
     await state.set_state(StoryCreation.waiting_for_hero)
 
 @dp.message(StoryCreation.waiting_for_hero, F.text)
 async def process_hero(message: Message, state: FSMContext):
     await state.update_data(hero=message.text.strip())
-    await message.answer("🎯 Шаг 3 из 3: Выберите тему сказки:", reply_markup=theme_keyboard)
+    await message.answer(
+        "🎯 Шаг 3 из 3: Выберите тему сказки или напишите свою:",
+        reply_markup=theme_keyboard
+    )
     await state.set_state(StoryCreation.waiting_for_theme)
 
 # ==========================================
-# 6. ГЕНЕРАЦИЯ ТЕКСТА (БЕЗ GOOGLE SDK - НА ПРЯМЫХ HTTP ЗАПРОСАХ)
+# 6. ПУЛЕНЕПРОБИВАЕМАЯ ГЕНЕРАЦИЯ ТЕКСТА И АУДИО
 # ==========================================
+def clean_text_for_tts(text: str) -> str:
+    """Очищает текст от любых спецсимволов и разметки для идеальной озвучки."""
+    text = re.sub(r'[*#_~`>|]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
 async def generate_story_text(child: str, hero: str, theme: str) -> str:
+    global current_key_index
+    keys = get_all_gemini_keys()
+    if not keys:
+        raise RuntimeError("В настройках Render (Environment) не найден GEMINI_API_KEY!")
+
     prompt = (
-        f"Сочини очень мягкую, успокаивающую сказку на ночь для малыша.\n"
+        f"Сочини очень мягкую, добрую, успокаивающую сказку на ночь для малыша.\n"
         f"Ребенок: {child}. Любимый герой: {hero}. Тема: {theme}.\n"
-        f"Используй плавные переходы, тире и точки, чтобы текст звучал мелодично и неторопливо.\n"
-        f"Объем строго 65-85 слов. Только чистый текст без звездочек и спецсимволов."
+        f"Используй плавные переходы, ласковые слова и спокойный ритм, чтобы текст звучал мелодично и неторопливо.\n"
+        f"Объем строго 65-85 слов. Напиши только чистый текст самой сказки на русском языке без заголовков и звездочек."
     )
 
-    # Динамический сбор всех ключей
-    keys = []
-    main_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if main_key: keys.append(main_key.strip().strip("'\""))
-    
-    for i in range(2, 6):
-        val = os.environ.get(f"GEMINI_API_KEY_{i}")
-        if val: keys.append(val.strip().strip("'\""))
-        
-    if not keys:
-        raise RuntimeError("API ключ не настроен в Render.")
+    # Полный список актуальных бесплатных моделей (перебираются по очереди при перегрузке)
+    endpoints = [
+        ("v1beta", "gemini-2.0-flash"),
+        ("v1beta", "gemini-2.0-flash-lite"),
+        ("v1beta", "gemini-1.5-flash"),
+        ("v1", "gemini-1.5-flash"),
+        ("v1beta", "gemini-1.5-flash-8b"),
+        ("v1beta", "gemini-2.5-flash")
+    ]
 
-    models = ["gemini-1.5-flash", "gemini-1.5-flash-8b"]
-    last_error = "Неизвестная ошибка связи"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 350
+        },
+        "safetySettings": [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+        ]
+    }
 
-    # Отправляем запросы НАПРЯМУЮ, минуя багованные библиотеки, с помощью aiohttp
-    async with aiohttp.ClientSession() as session:
-        for key_idx, current_key in enumerate(keys):
-            for model_name in models:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={current_key}"
-                payload = {
-                    "contents": [{"parts": [{"text": prompt}]}]
-                }
+    last_error = "Неизвестная ошибка"
+    timeout_cfg = aiohttp.ClientTimeout(total=18.0, connect=6.0)
+
+    async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
+        num_keys = len(keys)
+        for k_offset in range(num_keys):
+            key_idx = (current_key_index + k_offset) % num_keys
+            api_key = keys[key_idx]
+
+            for api_ver, model_name in endpoints:
+                url = f"https://generativelanguage.googleapis.com/{api_ver}/models/{model_name}:generateContent?key={api_key}"
                 try:
-                    async with session.post(url, json=payload, timeout=20.0) as resp:
+                    async with session.post(url, json=payload) as resp:
                         if resp.status == 200:
                             data = await resp.json()
-                            try:
-                                text = data["candidates"][0]["content"]["parts"][0]["text"]
-                                logging.info(f"Сказка создана! (Модель {model_name})")
-                                return text.replace("*", "").replace("#", "").strip()
-                            except (KeyError, IndexError):
-                                last_error = "Успешно, но Гугл прислал пустой текст."
+                            candidates = data.get("candidates", [])
+                            if candidates and "content" in candidates[0]:
+                                parts = candidates[0]["content"].get("parts", [])
+                                if parts and "text" in parts[0]:
+                                    raw_text = parts[0]["text"]
+                                    clean = clean_text_for_tts(raw_text)
+                                    if len(clean) > 20:
+                                        current_key_index = key_idx  # Запоминаем рабочий ключ
+                                        logging.info(f"Сказка успешно создана: Ключ #{key_idx+1}, {api_ver}/{model_name}")
+                                        return clean
+                            last_error = f"Пустой ответ от {model_name}"
+                        elif resp.status in (429, 503, 504):
+                            last_error = f"Перегрузка ({resp.status}) на {model_name}"
+                            logging.warning(f"Ключ #{key_idx+1} [{model_name}] занят ({resp.status}), переключаю...")
+                            await asyncio.sleep(0.7)
                         else:
-                            err_text = await resp.text()
-                            # Если ошибка есть, мы её сохраняем, чтобы показать вам!
-                            last_error = f"Код {resp.status}: {err_text[:120]}"
-                            logging.warning(f"Ошибка API: {last_error}")
+                            err_body = await resp.text()
+                            last_error = f"Код {resp.status} ({model_name})"
+                            logging.warning(f"Пропуск {api_ver}/{model_name}: {err_body[:120]}")
+                except asyncio.TimeoutError:
+                    last_error = f"Таймаут ожидания ({model_name})"
+                    logging.warning(f"Таймаут на {model_name}, пробуем следующую модель...")
                 except Exception as e:
-                    last_error = f"Сетевая ошибка: {str(e)}"
-                    logging.warning(last_error)
-                
-                await asyncio.sleep(1.0)
+                    last_error = f"Ошибка сети: {str(e)[:80]}"
+                    logging.warning(f"Сбой запроса {model_name}: {e}")
 
-    # Если ничего не помогло, бот выведет РЕАЛЬНУЮ причину прямо в чат Telegram
-    raise RuntimeError(f"Сбой подключения.\nТехническая причина: {last_error}")
+    raise RuntimeError(f"Не удалось получить ответ от нейросети ({last_error}). Пожалуйста, попробуйте нажать кнопку еще раз через минуту.")
 
 async def generate_audio_natural(text: str, file_path: str):
-    try:
-        communicate = edge_tts.Communicate(text, "ru-RU-SvetlanaNeural", rate="-10%")
-        await asyncio.wait_for(communicate.save(file_path), timeout=12.0)
-        if os.path.exists(file_path) and os.path.getsize(file_path) > 500:
-            return
-    except Exception as e:
-        logging.warning(f"edge-tts недоступен, используем gTTS: {e}")
+    """Двойной резерв живых нейро-голосов Microsoft + аварийный gTTS."""
+    voices = ["ru-RU-SvetlanaNeural", "ru-RU-DariyaNeural"]
+    
+    for voice in voices:
+        try:
+            communicate = edge_tts.Communicate(text, voice, rate="-10%")
+            await asyncio.wait_for(communicate.save(file_path), timeout=14.0)
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 1000:
+                logging.info(f"Аудио успешно записано голосом {voice}")
+                return
+        except Exception as e:
+            logging.warning(f"Голос {voice} не ответил вовремя, переключаю: {e}")
 
+    logging.info("Переход на резервную озвучку gTTS...")
     def run_gtts():
-        tts = gTTS(text=text, lang='ru', slow=True)
+        tts = gTTS(text=text, lang='ru', slow=False)
         tts.save(file_path)
     await asyncio.to_thread(run_gtts)
 
 # ==========================================
-# 7. ФИНАЛЬНЫЙ ШАГ И ОТПРАВКА
+# 7. ФИНАЛЬНЫЙ ШАГ И ОТПРАВКА СКАЗКИ
 # ==========================================
 @dp.message(StoryCreation.waiting_for_theme, F.text)
 async def process_theme_and_finish(message: Message, state: FSMContext):
     theme_text = message.text.strip()
     if theme_text == "✍️ Своя тема":
-        await message.answer("Напишите кратко, о чем должна быть сказка:")
+        await message.answer("✍️ Напишите кратко, о чем должна быть сказка (например: как полюбить купаться):")
+        return
+
+    user_id = message.from_user.id
+    if user_id in active_generations:
+        await message.answer("⏳ Ваша сказка уже создается, подождите пару секунд...")
         return
 
     data = await state.get_data()
     await state.clear()
-    user_id = message.from_user.id
 
     if get_user_balance(user_id) <= 0:
-        await message.answer("🌙 Сказки закончились! Пополните баланс:", reply_markup=get_tariffs_inline_kb())
+        await message.answer("🌙 Сказки на балансе закончились! Пополните баланс:", reply_markup=get_tariffs_inline_kb())
         return
 
     child = data.get("child_info", "малыша")
     hero = data.get("hero", "героя")
 
-    status_msg = await message.answer("✨ Волшебство начинается! Рассказываю сказку...", reply_markup=ReplyKeyboardRemove())
+    active_generations.add(user_id)
+    status_msg = await message.answer(
+        "✨ Волшебство начинается! Сочиняю добрую сказку...", 
+        reply_markup=ReplyKeyboardRemove()
+    )
+    
     msg_id = message.message_id.real if hasattr(message.message_id, 'real') else message.message_id
-    audio_path = f"/tmp/story_{message.chat.id}_{msg_id}.mp3" if os.path.exists("/tmp") else f"story_{message.chat.id}_{msg_id}.mp3"
+    audio_path = f"/tmp/story_{user_id}_{msg_id}.mp3" if os.path.exists("/tmp") else f"story_{user_id}_{msg_id}.mp3"
 
     try:
-        story_text = await generate_story_text(child, hero, theme_text)
-        await message.answer(f"📖 Сказка для {child}\n\n{story_text}")
+        async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
+            story_text = await generate_story_text(child, hero, theme_text)
         
-        try: await status_msg.edit_text("🎙 Записываю мягкий голос...")
-        except Exception: pass
+        await message.answer(f"📖 **Сказка для {child}**\n\n{story_text}")
+        
+        try:
+            await status_msg.edit_text("🎙 Записываю мягкий убаюкивающий голос...")
+        except Exception:
+            pass
 
-        await generate_audio_natural(story_text, audio_path)
+        async with ChatActionSender.record_voice(bot=bot, chat_id=message.chat.id):
+            await generate_audio_natural(story_text, audio_path)
+            
         voice_file = FSInputFile(audio_path)
         remaining = use_one_story(user_id)
 
         await message.answer_voice(
             voice=voice_file, 
-            caption=f"🎧 Аудиосказка про {hero} готова!\nСладких снов малышу ✨\n\n🎁 Осталось сказок на балансе: {remaining} шт."
+            caption=(
+                f"🎧 Аудиосказка про {hero} готова!\n"
+                f"Сладких снов малышу ✨\n\n"
+                f"🎁 Осталось сказок на балансе: {remaining} шт."
+            )
         )
-        try: await status_msg.delete()
-        except Exception: pass
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
-        await message.answer("Выберите действие:", reply_markup=main_menu_keyboard)
+        await message.answer("Выберите действие в меню ниже:", reply_markup=main_menu_keyboard)
 
     except Exception as e:
-        logging.error(f"Ошибка: {e}")
-        # Теперь бот выведет точную подробную ошибку от Google
-        await message.answer(f"⚠️ {str(e)[:400]}\n(Попытка не списана)", reply_markup=main_menu_keyboard)
+        logging.error(f"Ошибка при создании сказки: {e}")
+        await message.answer(
+            f"⚠️ {str(e)[:350]}\n\n(Попытка не списана с вашего баланса)", 
+            reply_markup=main_menu_keyboard
+        )
     finally:
+        active_generations.discard(user_id)
         if os.path.exists(audio_path):
-            try: os.remove(audio_path)
-            except Exception: pass
+            try:
+                os.remove(audio_path)
+            except Exception:
+                pass
 
 # ==========================================
-# 8. ВЕБ-СЕРВЕР RENDER И ЗАПУСК
+# 8. ВЕБ-СЕРВЕР RENDER И БЕЗОПАСНЫЙ ЗАПУСК
 # ==========================================
 async def handle_ping(request):
-    return web.Response(text="OK")
+    return web.Response(text="OK - FairyTale Bot is running")
 
 async def start_server():
     app = web.Application()
@@ -380,17 +500,34 @@ async def start_server():
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', port)
-    logging.info(f"WEB SERVER STARTED ON PORT {port}")
+    await site.start()  # Мгновенно открываем порт для Render!
+    logging.info(f"WEB SERVER SUCCESSFULLY BOUND TO PORT {port}")
+    return runner
 
 async def main():
     logging.info("STARTING BOT SERVICE...")
-    await start_server()
+    # 1. Сначала мгновенно открываем порт, чтобы Render завершил старый контейнер
+    server_runner = await start_server()
     init_db()
-    await asyncio.sleep(1)
+    
+    keys_count = len(get_all_gemini_keys())
+    logging.info(f"Загружено ключей Gemini API: {keys_count} шт.")
+
+    # 2. Ждем 4 секунды, чтобы старый экземпляр гарантированно отключился на Render
+    await asyncio.sleep(4)
     
     await bot.delete_webhook(drop_pending_updates=True)
     logging.info("STARTING TELEGRAM POLLING...")
-    await dp.start_polling(bot)
+    
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        logging.info("SHUTTING DOWN GRACEFULLY...")
+        await bot.session.close()
+        await server_runner.cleanup()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Bot stopped.")

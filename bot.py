@@ -1,34 +1,48 @@
-import asyncio
 import os
-import aiohttp
-from aiohttp import web
-import edge_tts
-from dotenv import load_dotenv
+import sys
+import logging
+import threading
+import asyncio
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from telebot.async_telebot import AsyncTeleBot
+from google import genai
+from gtts import gTTS
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import FSInputFile
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
 
-load_dotenv()
+# 1. Запуск мини веб-сервера для Render (устраняет ошибку "No open ports detected")
+class RenderHealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+    def log_message(self, format, *args):
+        return  # Не засоряем логи фоновыми проверками Render
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+def run_background_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), RenderHealthCheckHandler)
+    server.serve_forever()
 
-# Мягкий и глубокий голос сказочника с убаюкивающим темпом
-VOICE = "ru-RU-DmitryNeural"
-VOICE_RATE = "-12%"
+threading.Thread(target=run_background_web_server, daemon=True).start()
 
-class StoryForm(StatesGroup):
-    waiting_for_details = State()
+# 2. Инициализация токенов и клиентов
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-@dp.message(CommandStart())
-async def cmd_start(message: types.Message, state: FSMContext):
-    await message.answer(
+if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
+    logging.error("ВНИМАНИЕ: Не заданы переменные TELEGRAM_BOT_TOKEN или GEMINI_API_KEY в Render Environment!")
+
+bot = AsyncTeleBot(TELEGRAM_BOT_TOKEN)
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# 3. Обработчик команды /start
+@bot.message_handler(commands=['start'])
+async def send_welcome(message):
+    welcome_text = (
         "👋 Привет! Я создаю персональные аудиосказки для детей.\n\n"
         "Напиши мне:\n"
         "1. Имя и возраст ребенка\n"
@@ -36,102 +50,76 @@ async def cmd_start(message: types.Message, state: FSMContext):
         "3. Какую проблему решить или тему сказки\n\n"
         "✍️ Отправь всё одним сообщением:"
     )
-    await state.set_state(StoryForm.waiting_for_details)
+    await bot.reply_to(message, welcome_text)
 
-@dp.message(StoryForm.waiting_for_details)
-async def generate_story(message: types.Message, state: FSMContext):
-    user_prompt = message.text
-    status_msg = await message.answer("✨ Сочиняю сказку...")
+# Вспомогательная функция для синхронного сохранения аудио через gTTS
+def generate_audio_file(text: str, filename: str):
+    tts = gTTS(text=text, lang='ru', slow=False)
+    tts.save(filename)
 
-    if not GEMINI_API_KEY:
-        await status_msg.edit_text("Ошибка: в настройках Render не задан GEMINI_API_KEY!")
-        await state.clear()
-        return
-
-    key = GEMINI_API_KEY.strip()
-    headers = {"Content-Type": "application/json"}
+# 4. Основной обработчик создания сказки
+@bot.message_handler(func=lambda message: True)
+async def generate_fairytale(message):
+    status_msg = await bot.reply_to(message, "✨ Сочиняю сказку...")
     
-    prompt = (
-        "Ты детский писатель-сказкотерапевт. Напиши добрую, нежную и короткую терапевтическую сказку "
-        "для малыша на русском языке на основе пожелания: "
-        f"{user_prompt}\n\n"
-        "Требования: объем около 130-160 слов. Пиши сплошным текстом без звездочек (*), "
-        "решеток (#), кавычек, дефисов в начале строк и списков, так как текст пойдет прямо в аудио-озвучку."
-    )
-
-    payload = {
-        "contents": [
-            {
-                "parts": [{"text": prompt}]
-            }
-        ]
-    }
-
-    story_text = None
-    debug_info = ""
-
-    async with aiohttp.ClientSession() as session:
-        # Автоматический опрос доступных моделей для данного ключа
-        list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}"
-        try:
-            async with session.get(list_url) as resp:
-                models_data = await resp.json()
-                if "models" in models_data:
-                    available_models = [
-                        m["name"] for m in models_data["models"] 
-                        if "generateContent" in m.get("supportedGenerationMethods", [])
-                    ]
-                else:
-                    available_models = []
-                    debug_info = f"Ошибка списка моделей: {models_data}"
-        except Exception as e:
-            available_models = []
-            debug_info = f"Сетевая ошибка при запросе моделей: {e}"
-
-        if available_models:
-            available_models.sort(key=lambda x: ("flash" not in x, x))
-            for full_model_name in available_models:
-                gen_url = f"https://generativelanguage.googleapis.com/v1beta/{full_model_name}:generateContent?key={key}"
-                try:
-                    async with session.post(gen_url, headers=headers, json=payload) as resp:
-                        data = await resp.json()
-                        if "candidates" in data and len(data["candidates"]) > 0:
-                            story_text = data["candidates"][0]["content"]["parts"][0]["text"]
-                            break
-                        else:
-                            debug_info = f"Ошибка {full_model_name}: {str(data.get('error', data))[:120]}"
-                except Exception as e:
-                    debug_info = str(e)
-        elif not debug_info:
-            debug_info = "Google не вернул доступных моделей для текста."
-
-    if not story_text:
-        await status_msg.edit_text(f"Не удалось получить текст от Gemini:\n{debug_info[:300]}")
-        await state.clear()
-        return
-
-    await status_msg.edit_text(story_text)
-    audio_status = await message.answer("🎙 Записываю аудиосказку...")
-
-    audio_path = f"story_{message.from_user.id}.mp3"
     try:
-        communicate = edge_tts.Communicate(story_text, VOICE, rate=VOICE_RATE)
-        await communicate.save(audio_path)
+        # Промпт для Gemini
+        prompt = (
+            "Ты добрый сказочник для малышей. Сочини короткую, терапевтическую, "
+            "успокаивающую и добрую сказку на ночь на основе следующего запроса:\n\n"
+            f"{message.text}\n\n"
+            "Требования к сказке:\n"
+            "- Простой, плавный и мелодичный язык для маленького ребенка.\n"
+            "- Длина примерно 150-200 слов.\n"
+            "- Без markdown-разметки (без звездочек, решеток и спецсимволов), чтобы текст идеально читался озвучкой."
+        )
 
-        audio_file = FSInputFile(audio_path)
-        await message.answer_audio(audio_file, caption="🎧 Персональная сказка")
-        await audio_status.delete()
+        # Генерация текста сказки через Gemini
+        response = await asyncio.to_thread(
+            ai_client.models.generate_content,
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+        story_text = response.text.strip()
+        
+        # Отправляем готовый текст в чат
+        await bot.send_message(message.chat.id, story_text)
+        await bot.edit_message_text("🎙 Записываю озвучку...", chat_id=message.chat.id, message_id=status_msg.message_id)
+
+        # Имя временного аудиофайла
+        audio_file_path = f"story_{message.chat.id}_{message.message_id}.mp3"
+        
+        try:
+            # Озвучиваем текст в отдельном потоке, чтобы не блокировать бота
+            await asyncio.to_thread(generate_audio_file, story_text, audio_file_path)
+            
+            # Отправляем аудиофайл в Telegram
+            with open(audio_file_path, 'rb') as audio:
+                await bot.send_audio(
+                    message.chat.id, 
+                    audio, 
+                    title="Добрая сказка на ночь", 
+                    performer="Сказки для малышей",
+                    caption="🎧 Приятного прослушивания!"
+                )
+                
+            await bot.delete_message(chat_id=message.chat.id, message_id=status_msg.message_id)
+
+        except Exception as e:
+            logging.error(f"Ошибка при создании аудио: {e}")
+            await bot.send_message(
+                message.chat.id, 
+                "Сказка готова текстом выше, но файл озвучки сохранить не удалось."
+            )
+        finally:
+            # Удаляем временный файл с диска
+            if os.path.exists(audio_file_path):
+                os.remove(audio_file_path)
+
     except Exception as e:
-        await audio_status.edit_text(f"Ошибка озвучки: {e}")
-    finally:
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-        await state.clear()
+        logging.error(f"Общая ошибка генератора: {e}")
+        await bot.send_message(message.chat.id, "Произошла ошибка при сочинении сказки. Попробуйте еще раз.")
 
-async def handle_ping(request):
-    return web.Response(text="Bot is running")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    runner = web.AppRunner(app)
+# 5. Точка входа
+if __name__ == "__main__":
+    asyncio.run(bot.polling(non_stop=True))

@@ -17,15 +17,9 @@ raw_gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_
 BOT_TOKEN = raw_bot_token.strip().strip("'").strip('"')
 GEMINI_KEY = raw_gemini_key.strip().strip("'").strip('"')
 
-if not BOT_TOKEN:
-    logging.error("ВНИМАНИЕ: TELEGRAM_BOT_TOKEN не задан!")
-if not GEMINI_KEY:
-    logging.error("ВНИМАНИЕ: GEMINI_API_KEY не задан!")
-
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Инициализируем современный клиент Gemini
 ai_client = genai.Client(api_key=GEMINI_KEY)
 
 @dp.message(CommandStart())
@@ -49,7 +43,7 @@ def generate_story_sync(prompt_text: str) -> str:
     )
     
     response = ai_client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         contents=f"{system_instruction}\n\nЗапрос:\n{prompt_text}"
     )
     return response.text.strip()
@@ -60,7 +54,7 @@ async def handle_user_text(message: Message):
     audio_path = f"story_{message.chat.id}_{message.message_id}.mp3"
 
     try:
-        # 1. Генерация текста через Gemini
+        # 1. Генерация текста сказки
         story_text = await asyncio.to_thread(generate_story_sync, message.text)
         await message.answer(story_text)
         await status_msg.edit_text("🎙 Записываю озвучку...")
@@ -89,7 +83,7 @@ async def handle_user_text(message: Message):
         logging.error(f"Ошибка генерации: {error_details}")
         await message.answer(f"⚠️ Ошибка генерации:\n{error_details[:300]}")
 
-# Веб-сервер для прохождения проверки порта Render
+# Фоновый веб-сервер для прохождения проверки порта Render
 async def handle_ping(request):
     return web.Response(text="Bot is running")
 

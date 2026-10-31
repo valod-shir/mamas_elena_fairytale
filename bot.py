@@ -41,10 +41,15 @@ async def generate_story(message: types.Message, state: FSMContext):
     user_prompt = message.text
     status_msg = await message.answer("✨ Сочиняю сказку...")
 
+    if not OPENROUTER_API_KEY:
+        await status_msg.edit_text("Ошибка: в настройках Render не задан OPENROUTER_API_KEY!")
+        await state.clear()
+        return
+
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {OPENROUTER_API_KEY.strip()}",
         "HTTP-Referer": "https://render.com",
         "X-Title": "Fairytale Bot"
     }
@@ -53,15 +58,13 @@ async def generate_story(message: types.Message, state: FSMContext):
             {
                 "role": "system",
                 "content": (
-                    "Ты детский писатель. Напиши добрую, поучительную и нежную сказку на русском языке для ребенка. "
-                    "Объем: 150-200 слов. "
-                    "Используй только обычный текст без звездочек (*), решеток (#), кавычек-елочек и спецсимволов, "
-                    "так как весь текст сразу пойдет в голосовую озвучку."
+                    "Ты детский писатель. Напиши добрую, короткую сказку на ночь на русском языке. "
+                    "Объем: 150 слов. Без звездочек, решеток и спецсимволов."
                 )
             },
             {"role": "user", "content": user_prompt}
         ],
-        "model": "meta-llama/llama-3.1-8b-instruct:free",
+        "model": "deepseek/deepseek-chat:free",
         "temperature": 0.7
     }
 
@@ -69,9 +72,15 @@ async def generate_story(message: types.Message, state: FSMContext):
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, json=payload) as resp:
                 data = await resp.json()
-                story_text = data["choices"][0]["message"]["content"]
+                if "choices" in data and len(data["choices"]) > 0:
+                    story_text = data["choices"][0]["message"]["content"]
+                else:
+                    err_msg = str(data.get("error", data))
+                    await status_msg.edit_text(f"Ответ OpenRouter: {err_msg[:300]}")
+                    await state.clear()
+                    return
     except Exception as e:
-        await status_msg.edit_text("Не удалось сгенерировать текст через OpenRouter. Проверь баланс/ключ.")
+        await status_msg.edit_text(f"Ошибка запроса: {e}")
         await state.clear()
         return
 
@@ -87,7 +96,7 @@ async def generate_story(message: types.Message, state: FSMContext):
         await message.answer_audio(audio_file, caption="🎧 Персональная сказка")
         await audio_status.delete()
     except Exception as e:
-        await audio_status.edit_text("Сказка готова текстом выше, но озвучить не удалось.")
+        await audio_status.edit_text("Сказка готова текстом, но озвучить не получилось.")
     finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)
@@ -111,3 +120,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    

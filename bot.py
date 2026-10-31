@@ -116,7 +116,7 @@ async def generate_story(message: types.Message, state: FSMContext):
 
     audio_path = f"story_{message.from_user.id}.mp3"
     try:
-        communicate = edge_tts.Communicate(story_text, VOICE, rate="-15%", pitch="-2Hz")
+        communicate = edge_tts.Communicate(story_text, VOICE, rate="-15%")
         await communicate.save(audio_path)
 
         audio_file = FSInputFile(audio_path)

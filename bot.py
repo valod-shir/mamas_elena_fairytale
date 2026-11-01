@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import os
 import sys
 import re
@@ -15,7 +13,6 @@ import traceback
 import urllib.parse
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 
 import aiohttp
 from aiohttp import web
@@ -59,32 +56,36 @@ logging.basicConfig(
 # ==========================================
 # 1. КОНФИГУРАЦИЯ, ПУЛЫ ПОТОКОВ И СЕТЕВОЙ СЛОЙ
 # ==========================================
-raw_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("BOT_TOKEN") or ""
-BOT_TOKEN = raw_bot_token.strip().strip("'\"")
+raw_token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("BOT_TOKEN") or ""
+BOT_TOKEN = raw_token.strip().strip("'\"")
 
 if not BOT_TOKEN:
     logging.critical("КРИТИЧЕСКАЯ ОШИБКА: Не задан TELEGRAM_BOT_TOKEN!")
     sys.exit(1)
 
-raw_admin_id = os.environ.get("ADMIN_ID", "0").strip().strip("'\"")
-ADMIN_ID = int(raw_admin_id) if raw_admin_id.isdigit() else 0
+raw_admin = os.environ.get("ADMIN_ID", "0").strip().strip("'\"")
+ADMIN_ID = int(raw_admin) if raw_admin.isdigit() else 0
 
-WEBHOOK_BASE_URL = (os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+WEBHOOK_BASE_URL = (
+    os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL") or ""
+).strip().rstrip("/")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:32]
 
 UPSTASH_REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
 UPSTASH_REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
-TURSO_DB_URL = os.environ.get("TURSO_DATABASE_URL", "").strip().replace("libsql://", "https://").rstrip("/")
+TURSO_DB_URL = (
+    os.environ.get("TURSO_DATABASE_URL", "").strip().replace("libsql://", "https://").rstrip("/")
+)
 TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-tts_thread_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tts_cpu_pool")
+tts_thread_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tts_pool")
 tts_semaphore = asyncio.Semaphore(2)
 
-story_task_queue: asyncio.Queue | None = None
+story_task_queue = None
 NUM_QUEUE_WORKERS = 3
 active_generations = set()
 user_cooldowns = {}
@@ -92,7 +93,7 @@ COOLDOWN_SECONDS = 10.0
 
 current_key_index = 0
 cached_models_by_key = {}
-http_session: aiohttp.ClientSession | None = None
+http_session = None
 
 AVAILABLE_VOICES = {
     "ru-RU-SvetlanaNeural": "👩 Нежная Светлана",
@@ -103,15 +104,18 @@ AVAILABLE_VOICES = {
 ART_STYLES = {
     "pixar": (
         "🎬 Мультфильм Pixar 3D",
-        "Masterpiece 3D animation style like Pixar and Disney DreamWorks, cute adorable character, soft volumetric warm bedtime lantern lighting, magical starry night bedroom background, lush fluffy textures, 8k octane render, heartwarming"
+        "Masterpiece 3D animation style like Pixar and Disney, cute adorable character, "
+        "soft warm bedtime lantern lighting, starry night bedroom, fluffy textures, 8k render"
     ),
     "watercolor": (
         "🎨 Акварельная книжка",
-        "Masterpiece classic children story book illustration, soft pastel watercolor and colored pencils, Beatrix Potter cozy style, warm golden evening glow, gentle dreamy atmosphere, high detail"
+        "Masterpiece classic children story book illustration, soft pastel watercolor "
+        "and colored pencils, cozy style, warm golden evening glow, gentle dreamy atmosphere"
     ),
     "ghibli": (
         "🏮 Уютный стиль Миядзаки",
-        "Masterpiece Studio Ghibli Hayao Miyazaki anime art style, cozy warm bedroom at night, magical soft glowing stars outside window, gentle pastel colors, peaceful sleepy atmosphere, ultra detailed"
+        "Masterpiece Studio Ghibli Hayao Miyazaki art style, cozy warm bedroom at night, "
+        "magical glowing stars outside window, gentle pastel colors, peaceful sleepy mood"
     )
 }
 
@@ -123,14 +127,14 @@ TIMEZONE_OFFSETS = {
     "10": ("Владивосток (UTC+10)", 10),
 }
 
-def get_child_rank(total_stories: int) -> str:
+def get_child_rank(total_stories):
     if total_stories >= 15:
         return "\U0001f451 Магистр Сказочного Королевства"
     if total_stories >= 5:
         return "\u2b50 Хранитель Добрых Снов"
     return "\U0001f331 Юный Мечтатель"
 
-def get_all_gemini_keys() -> list[str]:
+def get_all_gemini_keys():
     keys = []
     candidates = [
         "GEMINI_API_KEY", "GOOGLE_API_KEY",
@@ -146,7 +150,7 @@ def get_all_gemini_keys() -> list[str]:
                     keys.append(clean_k)
     return keys
 
-async def get_http_session() -> aiohttp.ClientSession:
+async def get_http_session():
     global http_session
     if http_session is None or http_session.closed:
         timeout_cfg = aiohttp.ClientTimeout(total=35.0, connect=8.0)
@@ -154,20 +158,20 @@ async def get_http_session() -> aiohttp.ClientSession:
         http_session = aiohttp.ClientSession(timeout=timeout_cfg, connector=connector)
     return http_session
 
-def sanitize_input(text: str, max_len: int = 70) -> str:
+def sanitize_input(text, max_len=70):
     if not text:
         return ""
     cleaned = re.sub(r'[<>{}\[\]\\*$#^~`|]', '', text)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     return cleaned[:max_len]
 
-def is_admin(user_id: int) -> bool:
+def is_admin(user_id):
     return ADMIN_ID != 0 and user_id == ADMIN_ID
 
 # ==========================================
-# 2. МОНИТОРИНГ ОШИБОК И RETRY С EXPONENTIAL BACKOFF + JITTER
+# 2. МОНИТОРИНГ ОШИБОК И RETRY С EXPONENTIAL BACKOFF
 # ==========================================
-async def report_error_to_admin(context_title: str, exc: Exception):
+async def report_error_to_admin(context_title, exc):
     tb_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     logging.error(f"[{context_title}] {exc}\n{tb_str}")
     if ADMIN_ID != 0:
@@ -186,7 +190,7 @@ async def report_error_to_admin(context_title: str, exc: Exception):
 async def global_error_handler(event: ErrorEvent):
     await report_error_to_admin("Global Dispatcher Error", event.exception)
 
-async def retry_with_backoff(coro_factory, retries: int = 3, base_delay: float = 0.7, max_delay: float = 6.0):
+async def retry_with_backoff(coro_factory, retries=3, base_delay=0.7, max_delay=6.0):
     last_exc = None
     for attempt in range(retries):
         try:
@@ -203,16 +207,17 @@ async def retry_with_backoff(coro_factory, retries: int = 3, base_delay: float =
 # ==========================================
 # 3. REDIS АНТИ-ФЛУД И БАЗА ДАННЫХ (TURSO / SQLITE WAL)
 # ==========================================
-async def check_distributed_rate_limit(user_id: int) -> int:
+async def check_distributed_rate_limit(user_id):
     if UPSTASH_REDIS_URL and UPSTASH_REDIS_TOKEN:
         try:
             session = await get_http_session()
             key = f"ratelimit:user:{user_id}"
             headers = {"Authorization": f"Bearer {UPSTASH_REDIS_TOKEN}"}
+            cmd = [["SET", key, "1", "EX", str(int(COOLDOWN_SECONDS)), "NX"], ["TTL", key]]
             async with session.post(
                 f"{UPSTASH_REDIS_URL}/pipeline",
                 headers=headers,
-                json=[["SET", key, "1", "EX", str(int(COOLDOWN_SECONDS)), "NX"], ["TTL", key]],
+                json=cmd,
                 timeout=aiohttp.ClientTimeout(total=3.0)
             ) as resp:
                 if resp.status == 200:
@@ -232,26 +237,41 @@ async def check_distributed_rate_limit(user_id: int) -> int:
     user_cooldowns[user_id] = now
     return 0
 
-async def sync_query_to_turso_cloud(sql: str, args: list):
+async def sync_query_to_turso_cloud(sql, args):
     if not TURSO_DB_URL or not TURSO_AUTH_TOKEN:
         return
     try:
         session = await get_http_session()
-        headers = {"Authorization": f"Bearer {TURSO_AUTH_TOKEN}", "Content-Type": "application/json"}
+        headers = {
+            "Authorization": f"Bearer {TURSO_AUTH_TOKEN}",
+            "Content-Type": "application/json"
+        }
         formatted_args = []
         for a in args:
             if isinstance(a, int):
                 formatted_args.append({"type": "integer", "value": str(a)})
             else:
                 formatted_args.append({"type": "text", "value": str(a)})
-        payload = {"requests": [{"type": "execute", "stmt": {"sql": sql, "args": formatted_args}}, {"type": "close"}]}
-        async with session.post(f"{TURSO_DB_URL}/v2/pipeline", headers=headers, json=payload, timeout=5.0) as resp:
+        payload = {
+            "requests": [
+                {"type": "execute", "stmt": {"sql": sql, "args": formatted_args}},
+                {"type": "close"}
+            ]
+        }
+        async with session.post(
+            f"{TURSO_DB_URL}/v2/pipeline",
+            headers=headers,
+            json=payload,
+            timeout=5.0
+        ) as resp:
             if resp.status != 200:
                 logging.warning(f"Turso Cloud sync status: {resp.status}")
     except Exception as e:
         logging.warning(f"Turso Cloud sync warning: {e}")
 
-DB_PATH = os.environ.get("DATABASE_PATH") or ("/tmp/users.db" if os.path.exists("/tmp") else "users.db")
+DB_PATH = os.environ.get("DATABASE_PATH") or (
+    "/tmp/users.db" if os.path.exists("/tmp") else "users.db"
+)
 FREE_START_STORIES = 3
 REFERRAL_BONUS_STORIES = 2
 
@@ -307,7 +327,9 @@ def init_db():
                 created_at INTEGER
             )
         ''')
-        existing_cols = [row[1] for row in conn.execute("PRAGMA table_info(users);").fetchall()]
+        existing_cols = [
+            row[1] for row in conn.execute("PRAGMA table_info(users);").fetchall()
+        ]
         migrations = {
             "last_child": "TEXT DEFAULT ''",
             "last_hero": "TEXT DEFAULT ''",
@@ -328,7 +350,9 @@ def init_db():
                 except Exception as e:
                     logging.warning(f"Миграция {col_name}: {e}")
 
-        cache_cols = [row[1] for row in conn.execute("PRAGMA table_info(story_cache);").fetchall()]
+        cache_cols = [
+            row[1] for row in conn.execute("PRAGMA table_info(story_cache);").fetchall()
+        ]
         if "tomorrow_hook" not in cache_cols:
             try:
                 conn.execute("ALTER TABLE story_cache ADD COLUMN tomorrow_hook TEXT DEFAULT '';")
@@ -336,7 +360,7 @@ def init_db():
                 pass
         conn.commit()
 
-def register_or_get_user(user_id: int, referrer_id: int = 0):
+def register_or_get_user(user_id, referrer_id=0):
     ref_rewarded = False
     with get_db_connection() as conn:
         c = conn.cursor()
@@ -354,7 +378,8 @@ def register_or_get_user(user_id: int, referrer_id: int = 0):
                 c.execute("SELECT user_id FROM users WHERE user_id = ?", (valid_ref,))
                 if c.fetchone() is not None:
                     c.execute(
-                        "UPDATE users SET stories_left = stories_left + ?, referrals_count = referrals_count + 1 WHERE user_id = ?",
+                        "UPDATE users SET stories_left = stories_left + ?, "
+                        "referrals_count = referrals_count + 1 WHERE user_id = ?",
                         (REFERRAL_BONUS_STORIES, valid_ref)
                     )
                     ref_rewarded = True
@@ -363,12 +388,17 @@ def register_or_get_user(user_id: int, referrer_id: int = 0):
 
             c.execute(
                 """INSERT INTO users 
-                   (user_id, stories_left, total_generated, last_child, last_hero, last_story_summary, voice, referred_by, referrals_count, remind_time, tz_offset, art_style, tomorrow_hook) 
+                   (user_id, stories_left, total_generated, last_child, last_hero, 
+                    last_story_summary, voice, referred_by, referrals_count, 
+                    remind_time, tz_offset, art_style, tomorrow_hook) 
                    VALUES (?, ?, 0, '', '', '', 'ru-RU-SvetlanaNeural', ?, 0, '', 8, 'pixar', '')""",
                 (user_id, FREE_START_STORIES, valid_ref)
             )
             conn.commit()
-            return FREE_START_STORIES, 0, "", "", "", "ru-RU-SvetlanaNeural", 0, "", 8, "pixar", "", ref_rewarded
+            return (
+                FREE_START_STORIES, 0, "", "", "", "ru-RU-SvetlanaNeural",
+                0, "", 8, "pixar", "", ref_rewarded
+            )
 
         return (
             row[0], row[1], row[2] or "", row[3] or "",
@@ -377,32 +407,38 @@ def register_or_get_user(user_id: int, referrer_id: int = 0):
             row[9] or "pixar", row[10] or "", False
         )
 
-def get_user_data(user_id: int):
+def get_user_data(user_id):
     data = register_or_get_user(user_id)
     return data[:11]
 
-def set_user_voice(user_id: int, voice_id: str):
+def set_user_voice(user_id, voice_id):
     _ = get_user_data(user_id)
     with get_db_connection() as conn:
         conn.execute("UPDATE users SET voice = ? WHERE user_id = ?", (voice_id, user_id))
         conn.commit()
 
-def set_user_art_style(user_id: int, style_id: str):
+def set_user_art_style(user_id, style_id):
     _ = get_user_data(user_id)
     with get_db_connection() as conn:
         conn.execute("UPDATE users SET art_style = ? WHERE user_id = ?", (style_id, user_id))
         conn.commit()
 
-def set_user_reminder(user_id: int, remind_time: str, tz_offset: int | None = None):
+def set_user_reminder(user_id, remind_time, tz_offset=None):
     _ = get_user_data(user_id)
     with get_db_connection() as conn:
         if tz_offset is not None:
-            conn.execute("UPDATE users SET remind_time = ?, tz_offset = ? WHERE user_id = ?", (remind_time, tz_offset, user_id))
+            conn.execute(
+                "UPDATE users SET remind_time = ?, tz_offset = ? WHERE user_id = ?",
+                (remind_time, tz_offset, user_id)
+            )
         else:
-            conn.execute("UPDATE users SET remind_time = ? WHERE user_id = ?", (remind_time, user_id))
+            conn.execute(
+                "UPDATE users SET remind_time = ? WHERE user_id = ?",
+                (remind_time, user_id)
+            )
         conn.commit()
 
-def update_user_after_story(user_id: int, child: str, hero: str, summary: str, tomorrow_hook: str) -> tuple[int, int]:
+def update_user_after_story(user_id, child, hero, summary, tomorrow_hook):
     with get_db_connection() as conn:
         c = conn.cursor()
         c.execute(
@@ -417,27 +453,34 @@ def update_user_after_story(user_id: int, child: str, hero: str, summary: str, t
             (child, hero, summary, tomorrow_hook, user_id)
         )
         conn.commit()
-        c.execute("SELECT stories_left, total_generated FROM users WHERE user_id = ?", (user_id,))
+        c.execute(
+            "SELECT stories_left, total_generated FROM users WHERE user_id = ?",
+            (user_id,)
+        )
         row = c.fetchone()
         rem = row[0] if row else 0
         tot = row[1] if row else 1
     asyncio.create_task(sync_query_to_turso_cloud(
-        "UPDATE users SET stories_left = ?, last_child = ?, last_hero = ?, last_story_summary = ? WHERE user_id = ?",
+        "UPDATE users SET stories_left = ?, last_child = ?, last_hero = ?, "
+        "last_story_summary = ? WHERE user_id = ?",
         [rem, child, hero, summary, user_id]
     ))
     return rem, tot
 
-def add_stories_to_user(user_id: int, count: int) -> int:
+def add_stories_to_user(user_id, count):
     _ = get_user_data(user_id)
     with get_db_connection() as conn:
         c = conn.cursor()
-        c.execute("UPDATE users SET stories_left = stories_left + ? WHERE user_id = ?", (count, user_id))
+        c.execute(
+            "UPDATE users SET stories_left = stories_left + ? WHERE user_id = ?",
+            (count, user_id)
+        )
         conn.commit()
         c.execute("SELECT stories_left FROM users WHERE user_id = ?", (user_id,))
         row = c.fetchone()
         return row[0] if row else count
 
-def record_payment_idempotent(charge_id: str, user_id: int, stories_added: int, stars_amount: int) -> tuple[bool, int]:
+def record_payment_idempotent(charge_id, user_id, stories_added, stars_amount):
     _ = get_user_data(user_id)
     with get_db_connection() as conn:
         c = conn.cursor()
@@ -448,10 +491,14 @@ def record_payment_idempotent(charge_id: str, user_id: int, stories_added: int, 
             return False, (r[0] if r else 0)
 
         c.execute(
-            "INSERT INTO payments (charge_id, user_id, stories_added, stars_amount) VALUES (?, ?, ?, ?)",
+            "INSERT INTO payments (charge_id, user_id, stories_added, stars_amount) "
+            "VALUES (?, ?, ?, ?)",
             (charge_id, user_id, stories_added, stars_amount)
         )
-        c.execute("UPDATE users SET stories_left = stories_left + ? WHERE user_id = ?", (stories_added, user_id))
+        c.execute(
+            "UPDATE users SET stories_left = stories_left + ? WHERE user_id = ?",
+            (stories_added, user_id)
+        )
         conn.commit()
         c.execute("SELECT stories_left FROM users WHERE user_id = ?", (user_id,))
         row = c.fetchone()
@@ -460,16 +507,17 @@ def record_payment_idempotent(charge_id: str, user_id: int, stories_added: int, 
 # ==========================================
 # 4. КЭШИРОВАНИЕ ПОПУЛЯРНЫХ ТЕМ
 # ==========================================
-def make_cache_key(hero: str, theme: str) -> str:
+def make_cache_key(hero, theme):
     norm = f"{hero.strip().lower()}::{theme.strip().lower()}"
     return hashlib.md5(norm.encode("utf-8")).hexdigest()
 
-def get_cached_story(hero: str, theme: str, child: str) -> tuple[str, str, str, str, str] | None:
+def get_cached_story(hero, theme, child):
     key = make_cache_key(hero, theme)
     with get_db_connection() as conn:
         c = conn.cursor()
         c.execute(
-            "SELECT display_template, tts_template, summary, img_prompt, tomorrow_hook FROM story_cache WHERE cache_key = ?",
+            "SELECT display_template, tts_template, summary, img_prompt, tomorrow_hook "
+            "FROM story_cache WHERE cache_key = ?",
             (key,)
         )
         row = c.fetchone()
@@ -480,7 +528,7 @@ def get_cached_story(hero: str, theme: str, child: str) -> tuple[str, str, str, 
             return disp, tts_t, row[2], row[3], hook
     return None
 
-def save_story_to_cache(hero: str, theme: str, child: str, display_text: str, tts_text: str, summary: str, img_prompt: str, tomorrow_hook: str):
+def save_story_to_cache(hero, theme, child, display_text, tts_text, summary, img_prompt, tomorrow_hook):
     if not child or len(child) < 2:
         return
     key = make_cache_key(hero, theme)
@@ -496,7 +544,7 @@ def save_story_to_cache(hero: str, theme: str, child: str, display_text: str, tt
         )
         conn.commit()
 
-def get_global_stats() -> tuple[int, int, int, int, int]:
+def get_global_stats():
     with get_db_connection() as conn:
         c = conn.cursor()
         users_cnt = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
@@ -506,7 +554,7 @@ def get_global_stats() -> tuple[int, int, int, int, int]:
         cache_cnt = c.execute("SELECT COUNT(*) FROM story_cache").fetchone()[0]
         return users_cnt, stories_cnt, pay_cnt, stars_sum, cache_cnt
 
-async def send_db_backup_to_admin(reason: str = "Плановый бэкап"):
+async def send_db_backup_to_admin(reason="Плановый бэкап"):
     if ADMIN_ID == 0 or not os.path.exists(DB_PATH):
         return
     try:
@@ -520,12 +568,11 @@ async def send_db_backup_to_admin(reason: str = "Плановый бэкап"):
         logging.warning(f"Не удалось отправить бэкап админу: {e}")
 
 # ==========================================
-# 5. ТОЧНЫЙ ОРФОЭПИЧЕСКИЙ ПРОЦЕССОР ДЛЯ ДИКТОРА (БЕЗ ОШИБКИ «ВСЕ -> ВСЁ»)
+# 5. ОРФОЭПИЧЕСКИЙ ПРОЦЕССОР ДЛЯ ДИКТОРА
 # ==========================================
-# Только однозначные слова с «ё» (без опасного глобального 'все' -> 'всё'!)
 YO_WORDS_DICT = {
     "котенок": "котёнок", "Котенок": "Котёнок", "котенка": "котёнка", "котенку": "котёнку", "котенком": "котёнком",
-    "лисенок": "лисёнок", "лисенка": "лисёнка", "слоненок": "слонёнок", "тигренок": "тигрёнок", "медвежонок": "медвежонок",
+    "лисенок": "лисёнок", "лисенка": "лисёнка", "слоненок": "слонёнок", "тигренок": "тигрёнок",
     "ежик": "ёжик", "Ежик": "Ёжик", "ежика": "ёжика", "ежику": "ёжику", "ежиком": "ёжиком",
     "елка": "ёлка", "елочка": "ёлочка", "елочки": "ёлочки", "елке": "ёлке",
     "звездочка": "звёздочка", "Звездочка": "Звёздочка", "звездочки": "звёздочки", "звездочек": "звёздочек",
@@ -546,10 +593,9 @@ YO_WORDS_DICT = {
     "зеленый": "зелёный", "зеленая": "зелёная", "зеленое": "зелёное", "зеленые": "зелёные",
     "березка": "берёзка", "клен": "клён", "черемуха": "черёмуха", "пеленки": "пелёнки",
     "ребенок": "ребёнок", "ребенка": "ребёнка", "ребенку": "ребёнку", "ребенком": "ребёнком",
-    "свернулся": "свернулся", "одеялко": "одеялко", "одеяльце": "одеяльце", "еще": "ещё", "Еще": "Ещё"
+    "еще": "ещё", "Еще": "Ещё"
 }
 
-# Контекстные фразы со словом «всё/всём», чтобы никогда не ломать «все зверята / все засыпают»
 YO_CONTEXT_PHRASES = [
     ("во всем теле", "во всём теле"),
     ("во всем мире", "во всём мире"),
@@ -571,29 +617,20 @@ YO_CONTEXT_PHRASES = [
     ("тихонько поет", "тихонько поёт"),
 ]
 
-def prepare_russian_text_for_tts(text: str) -> str:
-    """Готовит безупречный русский текст для нейро-диктора: контекстная буква 'ё' и плавные паузы."""
-    # 1. Убираем любые знаки ударения Юникода \u0301, чтобы не рвать слова
+def prepare_russian_text_for_tts(text):
     result = text.replace("\u0301", "").replace("́", "")
-
-    # 2. Заменяем контекстные словосочетания
     for old_p, new_p in YO_CONTEXT_PHRASES:
         result = re.sub(re.escape(old_p), new_p, result, flags=re.IGNORECASE)
-
-    # 3. Точечно подставляем «ё» в однозначных словах
     for wrong, correct in YO_WORDS_DICT.items():
         result = re.sub(rf'\b{re.escape(wrong)}\b', correct, result)
-
-    # 4. Заменяем тире на запятую для плавной паузы без обрыва интонации
     result = re.sub(r'\s*[—–-]\s*', ', ', result)
     result = re.sub(r'[«»"“”]', '', result)
-    # Сохраняем чистые точки между абзацами, чтобы диктор мягко понижал голос в конце мыслей
     result = re.sub(r'\n+', ' ', result)
     result = re.sub(r'\s+', ' ', result).strip()
     return result
 
 # ==========================================
-# 6. ИНТЕРФЕЙС И КЛАВИАТУРЫ (С ГАРАНТИРОВАННЫМ ОТОБРАЖЕНИЕМ ЗВЁЗД \u2b50)
+# 6. ИНТЕРФЕЙС И КЛАВИАТУРЫ
 # ==========================================
 class StoryCreation(StatesGroup):
     waiting_for_child_info = State()
@@ -631,8 +668,7 @@ therapy_keyboard = ReplyKeyboardMarkup(
     one_time_keyboard=True
 )
 
-def get_tariffs_inline_kb() -> InlineKeyboardMarkup:
-    # Используем чистый символ \u2b50 (без ломающегося селектора \ufe0f) + явное слово «Звёзд»!
+def get_tariffs_inline_kb():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="\u2b50 5 сказок — 75 Звёзд", callback_data="buy_pack_5")],
@@ -642,7 +678,7 @@ def get_tariffs_inline_kb() -> InlineKeyboardMarkup:
         ]
     )
 
-def get_post_story_inline_kb() -> InlineKeyboardMarkup:
+def get_post_story_inline_kb():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Продолжить эту историю", callback_data="action_continue")],
@@ -652,7 +688,7 @@ def get_post_story_inline_kb() -> InlineKeyboardMarkup:
         ]
     )
 
-def get_style_and_voice_kb(current_voice: str, current_style: str) -> InlineKeyboardMarkup:
+def get_style_and_voice_kb(current_voice, current_style):
     rows = []
     for v_id, v_label in AVAILABLE_VOICES.items():
         mark = "✅ " if v_id == current_voice else ""
@@ -662,7 +698,7 @@ def get_style_and_voice_kb(current_voice: str, current_style: str) -> InlineKeyb
         rows.append([InlineKeyboardButton(text=f"🖼 Стиль: {mark}{s_label}", callback_data=f"setstyle_{s_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def get_reminder_inline_kb(current_time: str, current_tz: int) -> InlineKeyboardMarkup:
+def get_reminder_inline_kb(current_time, current_tz):
     times = ["20:00", "20:30", "21:00", "21:30", "22:00"]
     time_btns = []
     for t in times:
@@ -746,7 +782,8 @@ async def bedtime_reminder_scheduler():
             with get_db_connection() as conn:
                 c = conn.cursor()
                 rows = c.execute(
-                    "SELECT user_id, remind_time, tz_offset, last_reminded_date, last_child, last_hero, tomorrow_hook FROM users WHERE remind_time != ''"
+                    "SELECT user_id, remind_time, tz_offset, last_reminded_date, "
+                    "last_child, last_hero, tomorrow_hook FROM users WHERE remind_time != ''"
                 ).fetchall()
 
                 for uid, r_time, tz_off, last_date, l_child, l_hero, t_hook in rows:
@@ -755,7 +792,10 @@ async def bedtime_reminder_scheduler():
                     current_hm = user_now.strftime("%H:%M")
 
                     if current_hm == r_time and last_date != today_str:
-                        conn.execute("UPDATE users SET last_reminded_date = ? WHERE user_id = ?", (today_str, uid))
+                        conn.execute(
+                            "UPDATE users SET last_reminded_date = ? WHERE user_id = ?",
+                            (today_str, uid)
+                        )
                         conn.commit()
                         child_label = f" для {l_child}" if l_child else ""
                         hook_line = f"\n\n🔮 Анонс на сегодня: {t_hook}" if t_hook else ""
@@ -763,7 +803,8 @@ async def bedtime_reminder_scheduler():
                             await bot.send_message(
                                 uid,
                                 f"🌙 Время готовиться ко сну!\n\n"
-                                f"Пора проветрить спальню, приглушить свет и включить новую добрую сказку{child_label} ✨{hook_line}",
+                                f"Пора проветрить спальню, приглушить свет и включить "
+                                f"новую добрую сказку{child_label} ✨{hook_line}",
                                 reply_markup=get_post_story_inline_kb() if l_hero else main_menu_keyboard
                             )
                         except Exception:
@@ -775,7 +816,11 @@ async def bedtime_reminder_scheduler():
 @dp.message(Command("myid"))
 async def show_my_id(message: Message):
     uid = message.from_user.id
-    admin_status = "✅ Вы Администратор!" if is_admin(uid) else "ℹ️ Добавьте переменную ADMIN_ID с этим номером в Render -> Environment."
+    admin_status = (
+        "✅ Вы Администратор!"
+        if is_admin(uid)
+        else "ℹ️ Добавьте переменную ADMIN_ID с этим номером в Render -> Environment."
+    )
     await message.answer(f"🔑 Ваш Telegram ID: {uid}\n\n{admin_status}", reply_markup=main_menu_keyboard)
 
 @dp.message(Command("stats"))
@@ -900,10 +945,7 @@ async def award_diploma_callback(callback: CallbackQuery):
         f"За крепкий сон, добрые сновидения и самую тёплую улыбку перед сном!\n\n"
         f"🪄 Создайте персональную сказку для своего малыша: {ref_link}"
     )
-    await callback.message.answer(
-        diploma_text,
-        reply_markup=main_menu_keyboard
-    )
+    await callback.message.answer(diploma_text, reply_markup=main_menu_keyboard)
 
 @dp.callback_query(F.data == "ref_program")
 async def ref_program_callback(callback: CallbackQuery):
@@ -960,7 +1002,8 @@ async def show_tariffs(message: Message):
     await message.answer(
         f"💎 Пополнение баланса сказок\n"
         f"Сейчас доступно: {balance} шт.{hook_block}\n"
-        f"Каждая сказка включает потоковый текст, иллюстрацию в стиле Pixar/Акварель, сонный дыхательный ритуал и живую озвучку.\n\n"
+        f"Каждая сказка включает потоковый текст, иллюстрацию в стиле Pixar/Акварель, "
+        f"сонный дыхательный ритуал и живую озвучку.\n\n"
         f"Выберите пакет ниже (оплата официальными \u2b50 Звёздами Telegram):",
         reply_markup=get_tariffs_inline_kb()
     )
@@ -991,7 +1034,7 @@ async def send_stars_invoice(callback: CallbackQuery):
     await bot.send_invoice(
         chat_id=callback.from_user.id,
         title=f"\u2b50 {title}",
-        description=f"Пакет на {stories_count} персональных аудиосказок с 3D-иллюстрациями, сонным дыхательным ритуалом и сказкотерапией.",
+        description=f"Пакет на {stories_count} персональных аудиосказок с 3D-иллюстрациями, сонным ритуалом и сказкотерапией.",
         payload=f"stars_{stories_count}_{stars_price}",
         provider_token="",
         currency="XTR",
@@ -1051,7 +1094,8 @@ async def start_command_handler(message: Message, state: FSMContext, command: Co
 
     await message.answer(
         f"👋 Добро пожаловать в мир добрых персональных аудиосказок!\n\n"
-        f"✨ Мы в реальном времени сочиняем убаюкивающие истории про вашего малыша, рисуем иллюстрацию в стиле Pixar/Акварель и проводим мягкий сонный ритуал живым голосом.\n"
+        f"✨ Мы в реальном времени сочиняем убаюкивающие истории про вашего малыша, "
+        f"рисуем иллюстрацию в стиле Pixar/Акварель и проводим мягкий сонный ритуал живым голосом.\n"
         f"🎁 Доступно сказок на балансе: {balance} шт.",
         reply_markup=main_menu_keyboard
     )
@@ -1146,7 +1190,7 @@ async def same_hero_cb(callback: CallbackQuery, state: FSMContext):
     )
     await state.set_state(StoryCreation.waiting_for_theme)
 
-async def enqueue_continuation(message: Message, user_id: int):
+async def enqueue_continuation(message: Message, user_id):
     balance, _, last_child, last_hero, last_summary, _, _, _, _, _, tomorrow_hook = get_user_data(user_id)
     if balance <= 0:
         hook_msg = f"\n\n🔮 В этой серии: «{tomorrow_hook}»" if tomorrow_hook else ""
@@ -1244,9 +1288,9 @@ async def process_custom_theme(message: Message, state: FSMContext):
     )
 
 # ==========================================
-# 9. ЯДРО ПОТОКОВОЙ ГЕНЕРАЦИИ, PIXAR/FLUX ИЛЛЮСТРАЦИЙ И БЕЗУПРЕЧНОГО TTS
+# 9. ЯДРО ПОТОКОВОЙ ГЕНЕРАЦИИ, PIXAR/FLUX ИЛЛЮСТРАЦИЙ И TTS
 # ==========================================
-def strip_service_tags_and_clean(raw_text: str, default_hero: str, default_theme: str) -> tuple[str, str, str, str, str]:
+def strip_service_tags_and_clean(raw_text, default_hero, default_theme):
     text = raw_text.replace("\u0301", "").strip()
     img_prompt = "cute adorable fluffy baby animal sleeping on soft glowing cloud pillow in cozy starry bedroom"
     summary = f"Добрая история про героя ({default_hero}) на тему: {default_theme}."
@@ -1279,7 +1323,7 @@ def strip_service_tags_and_clean(raw_text: str, default_hero: str, default_theme
 
     return cleaned, story_only, summary[:250], img_prompt[:220], tomorrow_hook[:200]
 
-async def fetch_available_models(session: aiohttp.ClientSession, api_key: str) -> list[str]:
+async def fetch_available_models(session, api_key):
     if api_key in cached_models_by_key:
         return cached_models_by_key[api_key]
 
@@ -1296,7 +1340,7 @@ async def fetch_available_models(session: aiohttp.ClientSession, api_key: str) -
                         if not any(x in name.lower() for x in ["vision", "embedding", "imagen", "aqa", "tts", "thinking", "exp"]):
                             valid_models.append(name)
 
-                def model_priority(m_name: str):
+                def model_priority(m_name):
                     m_low = m_name.lower()
                     if "2.0-flash" in m_low and "lite" not in m_low:
                         return 0
@@ -1315,7 +1359,7 @@ async def fetch_available_models(session: aiohttp.ClientSession, api_key: str) -
 
     return ["models/gemini-2.0-flash", "models/gemini-1.5-flash", "models/gemini-2.5-flash"]
 
-async def animate_streaming_text_for_user(live_message: Message, child: str, final_display_text: str, already_streamed_edits: int):
+async def animate_streaming_text_for_user(live_message, child, final_display_text, already_streamed_edits):
     paragraphs = [p.strip() for p in final_display_text.split("\n\n") if p.strip()]
     if already_streamed_edits < 2 and len(paragraphs) >= 2:
         accumulated_view = ""
@@ -1334,14 +1378,7 @@ async def animate_streaming_text_for_user(live_message: Message, child: str, fin
     except Exception:
         pass
 
-async def stream_and_generate_story_bundle(
-    child: str,
-    hero: str,
-    theme: str,
-    is_continuation: bool,
-    prev_summary: str,
-    live_message: Message
-) -> tuple[str, str, str, str, str, int]:
+async def stream_and_generate_story_bundle(child, hero, theme, is_continuation, prev_summary, live_message):
     global current_key_index
 
     if not is_continuation:
@@ -1358,10 +1395,12 @@ async def stream_and_generate_story_bundle(
         "Ты эталонный детский сказочник, логопед и специалист по детскому сну. "
         "Сочиняй добрые, музыкальные, гипнотически убаюкивающие сказки на ночь. "
         "ЗОЛОТЫЕ ПРАВИЛА ИДЕАЛЬНОЙ ДИКЦИИ ДЛЯ ОЗВУЧКИ: "
-        "1. Строго различай слова «все» (множественное число: все зверята спят) и «всё» (средний род: всё вокруг стихло). Всегда ставь точки над «ё» там, где звук [йо]! "
+        "1. Строго различай слова «все» (множественное число: все зверята спят) и «всё» (средний род: всё вокруг стихло). "
+        "Всегда ставь точки над «ё» там, где звук [йо]! "
         "2. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО ставить знаки ударения (символ ́) над буквами! "
-        "3. Полностью избегай слов-омографов (замок, кружки, стрелки, белки, стоит, дорога, чудная). Вместо них используй ласковые уменьшительно-ласкательные слова с однозначным ударением: кроватка, подушечка, одеяльце, звёздочка, глазки, лапки, хвостик, носик, домик, огонёк. "
-        "4. Пиши короткими певучими предложениями (по 8-12 слов) без тире и без скобок, чтобы голос диктора лился плавно, как колыбельная."
+        "3. Избегай слов-омографов (замок, кружки, стрелки, белки, стоит, дорога). "
+        "Используй ласковые слова с однозначным ударением: кроватка, подушечка, одеяльце, звёздочка, глазки, лапки, носик, домик. "
+        "4. Пиши короткими певучими предложениями без тире и без скобок."
     )
 
     if is_continuation:
@@ -1379,11 +1418,12 @@ async def stream_and_generate_story_bundle(
     prompt = (
         f"{system_rules}\n\n{context_block}\n"
         f"Строгий формат ответа:\n"
-        f"1. Сама сказка объемом 160-200 слов, разделенная на 3 абзаца. В 3-м (финальном) абзаце обязательно проведи мягкий «Сонный Дыхательный Ритуал»: предложи малышу вместе с героем сделать глубокий сонный вдох носиком, сладко потянуться в тёплой кроватке, закрыть глазки и уснуть.\n"
+        f"1. Сама сказка объемом 160-200 слов, разделенная на 3 абзаца. В 3-м абзаце проведи мягкий «Сонный Дыхательный Ритуал»: "
+        f"предложи малышу вместе с героем сделать глубокий сонный вдох носиком, сладко потянуться в тёплой кроватке, закрыть глазки и уснуть.\n"
         f"2. С новой строки заголовок '💬 Вопросы для малыша перед сном:' и 2 ласковых вопроса по сюжету.\n"
         f"3. С новой строки 'SUMMARY: ' и 1 предложение о том, что произошло.\n"
         f"4. С новой строки 'TOMORROW_HOOK: ' и 1 интригующее сказочное предложение-анонс того, какое доброе чудо ждёт героя в завтрашней серии.\n"
-        f"5. На последней строке 'IMAGE_PROMPT: ' и детальное описание сцены и героя ({hero}) на АНГЛИЙСКОМ языке (15-22 слова) для художника Pixar/Disney (например: adorable fluffy white kitten wearing tiny striped pajamas sleeping on a glowing crescent moon pillow in a cozy wooden bedroom).\n"
+        f"5. На последней строке 'IMAGE_PROMPT: ' и описание сцены и героя ({hero}) на АНГЛИЙСКОМ языке (15-20 слов) для художника Pixar/Disney.\n"
         f"Пиши без символов звездочек (*) и решеток (#)."
     )
 
@@ -1409,7 +1449,7 @@ async def stream_and_generate_story_bundle(
         for model_path in models:
             stream_url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:streamGenerateContent?alt=sse&key={api_key}"
             try:
-                async def _do_stream_request(_attempt: int):
+                async def _do_stream_request(_attempt):
                     accumulated = ""
                     last_edit_ts = 0.0
                     last_edited_len = 0
@@ -1468,11 +1508,7 @@ async def stream_and_generate_story_bundle(
 
     raise RuntimeError(f"Серверы нейросети перегружены ({last_error}). Пожалуйста, попробуйте через минуту.")
 
-async def generate_illustration_image(english_prompt: str, art_style_key: str, image_path: str) -> tuple[bool, str]:
-    """
-    Генерирует премиальную иллюстрацию через движок FLUX в высоком разрешении (1024x1024)
-    с поддержкой JPEG, PNG и WebP (без дешёвых стоковых фото!).
-    """
+async def generate_illustration_image(english_prompt, art_style_key, image_path):
     clean_en = re.sub(r'[^a-zA-Z0-9 ,.-]', '', english_prompt).strip()[:180]
     if len(clean_en) < 5:
         clean_en = "cute adorable fluffy baby character sleeping peacefully on a glowing cloud pillow"
@@ -1505,14 +1541,14 @@ async def generate_illustration_image(english_prompt: str, art_style_key: str, i
                     if len(content) > 8000 and is_valid_img:
                         with open(image_path, "wb") as f:
                             f.write(content)
-                        logging.info(f"Премиальная иллюстрация FLUX успешно создана ({len(content)} байт)!")
+                        logging.info(f"Иллюстрация FLUX успешно создана ({len(content)} байт)!")
                         return True, url
         except Exception as e:
             logging.warning(f"Попытка рендера иллюстрации: {e}")
 
     return False, flux_url_1
 
-async def send_illustration_guaranteed(message: Message, has_local_file: bool, image_path: str, flux_url: str, child: str, hero: str, style_key: str):
+async def send_illustration_guaranteed(message, has_local_file, image_path, flux_url, child, hero, style_key):
     style_title = ART_STYLES.get(style_key, ART_STYLES["pixar"])[0]
     caption = f"🎨 Иллюстрация для: {child}\n🧸 Герой: {hero} ({style_title})"
     if has_local_file and os.path.exists(image_path):
@@ -1520,21 +1556,21 @@ async def send_illustration_guaranteed(message: Message, has_local_file: bool, i
             await message.answer_photo(photo=FSInputFile(image_path), caption=caption)
             return
         except Exception as e:
-            logging.warning(f"Ошибка отправки локального фото, пробуем прямой URL: {e}")
+            logging.warning(f"Ошибка отправки локального фото, пробуем URL: {e}")
 
     try:
         await message.answer_photo(photo=URLInputFile(flux_url), caption=caption)
     except Exception as e:
         logging.warning(f"Не удалось отправить иллюстрацию по URL: {e}")
 
-async def generate_audio_natural(story_text_only: str, file_path: str, preferred_voice: str):
+async def generate_audio_natural(story_text_only, file_path, preferred_voice):
     phonetic_text = prepare_russian_text_for_tts(story_text_only)
     fallback_voices = [preferred_voice] + [v for v in AVAILABLE_VOICES.keys() if v != preferred_voice]
 
     async with tts_semaphore:
         for voice in fallback_voices:
             try:
-                async def _save_edge_tts(_attempt: int):
+                async def _save_edge_tts(_attempt):
                     communicate = edge_tts.Communicate(phonetic_text, voice, rate="-7%")
                     await asyncio.wait_for(communicate.save(file_path), timeout=28.0)
                     if not os.path.exists(file_path) or os.path.getsize(file_path) < 5000:
@@ -1554,26 +1590,7 @@ async def generate_audio_natural(story_text_only: str, file_path: str, preferred
 # ==========================================
 # 10. ФОНОВАЯ ОЧЕРЕДЬ ЗАДАЧ И ВОРКЕРЫ
 # ==========================================
-@dataclass
-class StoryJob:
-    message: Message
-    status_msg: Message
-    user_id: int
-    child: str
-    hero: str
-    theme_text: str
-    is_continuation: bool
-    prev_summary: str
-
-async def enqueue_story_job(
-    message: Message,
-    user_id: int,
-    child: str,
-    hero: str,
-    theme_text: str,
-    is_continuation: bool,
-    prev_summary: str
-):
+async def enqueue_story_job(message, user_id, child, hero, theme_text, is_continuation, prev_summary):
     if user_id in active_generations:
         await message.answer("⏳ Ваша сказка уже находится в работе, подождите пару секунд...")
         return
@@ -1597,20 +1614,28 @@ async def enqueue_story_job(
         reply_markup=ReplyKeyboardRemove()
     )
 
-    job = StoryJob(
-        message=message,
-        status_msg=status_msg,
-        user_id=user_id,
-        child=child,
-        hero=hero,
-        theme_text=theme_text,
-        is_continuation=is_continuation,
-        prev_summary=prev_summary
-    )
+    job = {
+        "message": message,
+        "status_msg": status_msg,
+        "user_id": user_id,
+        "child": child,
+        "hero": hero,
+        "theme_text": theme_text,
+        "is_continuation": is_continuation,
+        "prev_summary": prev_summary
+    }
     await story_task_queue.put(job)
 
-async def process_single_story_job(job: StoryJob):
-    user_id = job.user_id
+async def process_single_story_job(job):
+    user_id = job["user_id"]
+    msg = job["message"]
+    status_msg = job["status_msg"]
+    child = job["child"]
+    hero = job["hero"]
+    theme_text = job["theme_text"]
+    is_continuation = job["is_continuation"]
+    prev_summary = job["prev_summary"]
+
     unique_tag = f"{user_id}_{int(time.time() * 1000)}"
     audio_path = f"/tmp/story_{unique_tag}.mp3" if os.path.exists("/tmp") else f"story_{unique_tag}.mp3"
     image_path = f"/tmp/img_{unique_tag}.jpg" if os.path.exists("/tmp") else f"img_{unique_tag}.jpg"
@@ -1618,32 +1643,34 @@ async def process_single_story_job(job: StoryJob):
     try:
         _, _, _, _, _, preferred_voice, _, _, _, art_style, _ = get_user_data(user_id)
 
-        async with ChatActionSender.typing(bot=bot, chat_id=job.message.chat.id):
-            display_text, story_for_tts, new_summary, img_prompt, tomorrow_hook, edits_done = await stream_and_generate_story_bundle(
-                job.child, job.hero, job.theme_text, job.is_continuation, job.prev_summary, job.status_msg
+        async with ChatActionSender.typing(bot=bot, chat_id=msg.chat.id):
+            display_text, story_for_tts, new_summary, img_prompt, tomorrow_hook, edits_done = (
+                await stream_and_generate_story_bundle(
+                    child, hero, theme_text, is_continuation, prev_summary, status_msg
+                )
             )
 
-        async with ChatActionSender.record_voice(bot=bot, chat_id=job.message.chat.id):
+        async with ChatActionSender.record_voice(bot=bot, chat_id=msg.chat.id):
             _, (has_local_img, flux_url), _ = await asyncio.gather(
-                animate_streaming_text_for_user(job.status_msg, job.child, display_text, edits_done),
+                animate_streaming_text_for_user(status_msg, child, display_text, edits_done),
                 generate_illustration_image(img_prompt, art_style, image_path),
                 generate_audio_natural(story_for_tts, audio_path, preferred_voice)
             )
 
         await send_illustration_guaranteed(
-            job.message, has_local_img, image_path, flux_url, job.child, job.hero, art_style
+            msg, has_local_img, image_path, flux_url, child, hero, art_style
         )
 
         voice_file = FSInputFile(audio_path)
-        remaining, total_gen = update_user_after_story(user_id, job.child, job.hero, new_summary, tomorrow_hook)
+        remaining, total_gen = update_user_after_story(user_id, child, hero, new_summary, tomorrow_hook)
         rank_title = get_child_rank(total_gen)
 
         hook_teaser = f"\n🔮 В следующей серии: «{tomorrow_hook}»\n" if tomorrow_hook else "\n"
 
-        await job.message.answer_voice(
+        await msg.answer_voice(
             voice=voice_file,
             caption=(
-                f"🎧 Аудиосказка про героя ({job.hero}) готова!\n"
+                f"🎧 Аудиосказка про героя ({hero}) готова!\n"
                 f"🏅 Титул малыша: {rank_title}\n"
                 f"{hook_teaser}"
                 f"🎁 Осталось сказок на балансе: {remaining} шт."
@@ -1651,19 +1678,19 @@ async def process_single_story_job(job: StoryJob):
             reply_markup=get_post_story_inline_kb()
         )
 
-        # Smart Upsell (Фишка Билла Гейтса): если на балансе осталась 0 или 1 сказка, мягко предлагаем пополнить под интригу завтрашней серии
         if remaining <= 1 and tomorrow_hook:
-            await job.message.answer(
+            await msg.answer(
                 f"💡 Совет перед сном: у вас осталась {remaining} сказка на балансе.\n"
-                f"Чтобы завтра вечером малыш сразу узнал продолжение («{tomorrow_hook}»), вы можете пополнить баланс заранее:",
+                f"Чтобы завтра вечером малыш сразу узнал продолжение («{tomorrow_hook}»), "
+                f"вы можете пополнить баланс заранее:",
                 reply_markup=get_tariffs_inline_kb()
             )
         else:
-            await job.message.answer("Главное меню:", reply_markup=main_menu_keyboard)
+            await msg.answer("Главное меню:", reply_markup=main_menu_keyboard)
 
     except Exception as e:
         await report_error_to_admin("Story Worker Error", e)
-        await job.message.answer(
+        await msg.answer(
             f"⚠️ {str(e)[:350]}\n\n(Попытка сохранена на вашем балансе)",
             reply_markup=main_menu_keyboard
         )
@@ -1676,10 +1703,10 @@ async def process_single_story_job(job: StoryJob):
                 except Exception:
                     pass
 
-async def story_worker_loop(worker_id: int):
+async def story_worker_loop(worker_id):
     logging.info(f"Фоновый воркер очереди #{worker_id} запущен.")
     while True:
-        job: StoryJob = await story_task_queue.get()
+        job = await story_task_queue.get()
         try:
             await process_single_story_job(job)
         except Exception as e:
@@ -1693,7 +1720,7 @@ async def story_worker_loop(worker_id: int):
 async def handle_ping(request):
     return web.Response(text="OK - FairyTale Bot Enterprise is running")
 
-async def handle_telegram_webhook(request: web.Request):
+async def handle_telegram_webhook(request):
     secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
     if secret_header != WEBHOOK_SECRET:
         return web.Response(status=403, text="Forbidden")
@@ -1727,7 +1754,10 @@ async def main():
 
     server_runner = await start_server()
 
-    worker_tasks = [asyncio.create_task(story_worker_loop(i + 1)) for i in range(NUM_QUEUE_WORKERS)]
+    worker_tasks = [
+        asyncio.create_task(story_worker_loop(i + 1))
+        for i in range(NUM_QUEUE_WORKERS)
+    ]
     scheduler_task = asyncio.create_task(bedtime_reminder_scheduler())
 
     try:
@@ -1742,7 +1772,7 @@ async def main():
             logging.info(f"РЕЖИМ WEBHOOK АКТИВИРОВАН: {full_webhook_url}")
             await asyncio.Event().wait()
         else:
-            logging.info("RENDER_EXTERNAL_URL не обнаружен, переключение на Long Polling...")
+            logging.info("Переключение на Long Polling...")
             await asyncio.sleep(5)
             await bot.delete_webhook(drop_pending_updates=True)
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())

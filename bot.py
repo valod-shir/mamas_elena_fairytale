@@ -1,5 +1,5 @@
-from __future__ 
-import annotations
+from __future__ import annotations
+
 import os
 import sys
 import re
@@ -1158,4 +1158,606 @@ async def enqueue_continuation(message: Message, user_id: int):
 
     next_theme = tomorrow_hook if tomorrow_hook else "Новое доброе вечернее приключение и сладкий сон"
     await enqueue_story_job(
-        message=message
+        message=message,
+        user_id=user_id,
+        child=last_child or "Влада",
+        hero=last_hero,
+        theme_text=next_theme,
+        is_continuation=True,
+        prev_summary=last_summary
+    )
+
+@dp.message(StoryCreation.waiting_for_child_info, F.text)
+async def process_child_info(message: Message, state: FSMContext):
+    text = message.text.strip()
+    if text.startswith("⚡ Для:"):
+        _, _, last_child, last_hero, _, _, _, _, _, _, _ = get_user_data(message.from_user.id)
+        if last_child and last_hero:
+            await state.update_data(child_info=last_child, hero=last_hero, is_continuation=False)
+            await message.answer("🎯 Шаг 3 из 3: Выберите тему сказки:", reply_markup=theme_keyboard)
+            await state.set_state(StoryCreation.waiting_for_theme)
+            return
+
+    clean_child = sanitize_input(text, max_len=60)
+    if len(clean_child) < 2:
+        await message.answer("Пожалуйста, напишите имя ребенка (например: Влада, 3 года):")
+        return
+
+    await state.update_data(child_info=clean_child, is_continuation=False)
+    await message.answer(
+        "🧸 Шаг 2 из 3: Кто любимый персонаж или игрушка малыша?\n(Например: котенок Мау, зайчик Снежок, лошадка Майя)",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await state.set_state(StoryCreation.waiting_for_hero)
+
+@dp.message(StoryCreation.waiting_for_hero, F.text)
+async def process_hero(message: Message, state: FSMContext):
+    clean_hero = sanitize_input(message.text, max_len=60)
+    if len(clean_hero) < 2:
+        await message.answer("Пожалуйста, напишите имя любимого героя или игрушки:")
+        return
+
+    data = await state.get_data()
+    await state.update_data(hero=clean_hero)
+    kb = therapy_keyboard if data.get("therapy_mode") else theme_keyboard
+    await message.answer("🎯 Шаг 3 из 3: Выберите тему сказки или напишите свою:", reply_markup=kb)
+    await state.set_state(StoryCreation.waiting_for_theme)
+
+@dp.message(StoryCreation.waiting_for_theme, F.text)
+async def process_theme_choice(message: Message, state: FSMContext):
+    theme_text = message.text.strip()
+    if theme_text == "✍️ Своя тема":
+        await message.answer("✍️ Напишите кратко, о чем должна быть сказка (до 140 символов):")
+        await state.set_state(StoryCreation.waiting_for_custom_theme)
+        return
+
+    clean_theme = sanitize_input(theme_text, max_len=140)
+    data = await state.get_data()
+    await state.clear()
+    await enqueue_story_job(
+        message=message,
+        user_id=message.from_user.id,
+        child=data.get("child_info", "Влада"),
+        hero=data.get("hero", "Котёнок"),
+        theme_text=clean_theme,
+        is_continuation=False,
+        prev_summary=""
+    )
+
+@dp.message(StoryCreation.waiting_for_custom_theme, F.text)
+async def process_custom_theme(message: Message, state: FSMContext):
+    clean_theme = sanitize_input(message.text, max_len=140)
+    if len(clean_theme) < 3:
+        await message.answer("Пожалуйста, опишите тему чуть подробнее:")
+        return
+
+    data = await state.get_data()
+    await state.clear()
+    await enqueue_story_job(
+        message=message,
+        user_id=message.from_user.id,
+        child=data.get("child_info", "Влада"),
+        hero=data.get("hero", "Котёнок"),
+        theme_text=clean_theme,
+        is_continuation=False,
+        prev_summary=""
+    )
+
+# ==========================================
+# 9. ЯДРО ПОТОКОВОЙ ГЕНЕРАЦИИ, PIXAR/FLUX ИЛЛЮСТРАЦИЙ И БЕЗУПРЕЧНОГО TTS
+# ==========================================
+def strip_service_tags_and_clean(raw_text: str, default_hero: str, default_theme: str) -> tuple[str, str, str, str, str]:
+    text = raw_text.replace("\u0301", "").strip()
+    img_prompt = "cute adorable fluffy baby animal sleeping on soft glowing cloud pillow in cozy starry bedroom"
+    summary = f"Добрая история про героя ({default_hero}) на тему: {default_theme}."
+    tomorrow_hook = f"Новое волшебное открытие, которое {default_hero} покажет малышу перед сном."
+
+    img_match = re.search(r'IMAGE[_ ]?PROMPT\s*:\s*(.+)', text, flags=re.IGNORECASE)
+    if img_match:
+        img_prompt = img_match.group(1).strip()
+        text = re.sub(r'IMAGE[_ ]?PROMPT\s*:\s*.+', '', text, flags=re.IGNORECASE).strip()
+
+    hook_match = re.search(r'TOMORROW[_ ]?HOOK\s*:\s*(.+)', text, flags=re.IGNORECASE)
+    if hook_match:
+        tomorrow_hook = hook_match.group(1).strip()
+        text = re.sub(r'TOMORROW[_ ]?HOOK\s*:\s*.+', '', text, flags=re.IGNORECASE).strip()
+
+    sum_match = re.search(r'SUMMARY\s*:\s*(.+)', text, flags=re.IGNORECASE)
+    if sum_match:
+        summary = sum_match.group(1).strip()
+        text = re.sub(r'SUMMARY\s*:\s*.+', '', text, flags=re.IGNORECASE).strip()
+
+    cleaned = re.sub(r'[*#_~`>|]', '', text)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+
+    story_only = cleaned
+    for marker in ["💬 Вопросы", "Вопросы для малыша", "ВОПРОСЫ ДЛЯ ОБСУЖДЕНИЯ", "ПЕРЕД СНОМ"]:
+        if marker.lower() in cleaned.lower():
+            idx = cleaned.lower().find(marker.lower())
+            story_only = cleaned[:idx].strip()
+            break
+
+    return cleaned, story_only, summary[:250], img_prompt[:220], tomorrow_hook[:200]
+
+async def fetch_available_models(session: aiohttp.ClientSession, api_key: str) -> list[str]:
+    if api_key in cached_models_by_key:
+        return cached_models_by_key[api_key]
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    try:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                valid_models = []
+                for m in data.get("models", []):
+                    name = m.get("name", "")
+                    methods = m.get("supportedGenerationMethods", [])
+                    if "generateContent" in methods and "gemini" in name.lower():
+                        if not any(x in name.lower() for x in ["vision", "embedding", "imagen", "aqa", "tts", "thinking", "exp"]):
+                            valid_models.append(name)
+
+                def model_priority(m_name: str):
+                    m_low = m_name.lower()
+                    if "2.0-flash" in m_low and "lite" not in m_low:
+                        return 0
+                    if "1.5-flash" in m_low and "8b" not in m_low:
+                        return 1
+                    if "2.5-flash" in m_low:
+                        return 2
+                    return 3
+
+                valid_models.sort(key=model_priority)
+                if valid_models:
+                    cached_models_by_key[api_key] = valid_models
+                    return valid_models
+    except Exception as e:
+        logging.warning(f"Ошибка получения списка моделей: {e}")
+
+    return ["models/gemini-2.0-flash", "models/gemini-1.5-flash", "models/gemini-2.5-flash"]
+
+async def animate_streaming_text_for_user(live_message: Message, child: str, final_display_text: str, already_streamed_edits: int):
+    paragraphs = [p.strip() for p in final_display_text.split("\n\n") if p.strip()]
+    if already_streamed_edits < 2 and len(paragraphs) >= 2:
+        accumulated_view = ""
+        for para in paragraphs[:-1]:
+            accumulated_view = f"{accumulated_view}\n\n{para}".strip() if accumulated_view else para
+            try:
+                await live_message.edit_text(
+                    f"📖 Сказка для: {child} (печатается... ✍️)\n\n{accumulated_view}"
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(0.8)
+
+    try:
+        await live_message.edit_text(f"📖 Сказка для: {child}\n\n{final_display_text[:4050]}")
+    except Exception:
+        pass
+
+async def stream_and_generate_story_bundle(
+    child: str,
+    hero: str,
+    theme: str,
+    is_continuation: bool,
+    prev_summary: str,
+    live_message: Message
+) -> tuple[str, str, str, str, str, int]:
+    global current_key_index
+
+    if not is_continuation:
+        cached = get_cached_story(hero, theme, child)
+        if cached:
+            logging.info("Сюжет взят из кэша популярных тем!")
+            return cached[0], cached[1], cached[2], cached[3], cached[4], 0
+
+    keys = get_all_gemini_keys()
+    if not keys:
+        raise RuntimeError("Не найден GEMINI_API_KEY в настройках Render!")
+
+    system_rules = (
+        "Ты эталонный детский сказочник, логопед и специалист по детскому сну. "
+        "Сочиняй добрые, музыкальные, гипнотически убаюкивающие сказки на ночь. "
+        "ЗОЛОТЫЕ ПРАВИЛА ИДЕАЛЬНОЙ ДИКЦИИ ДЛЯ ОЗВУЧКИ: "
+        "1. Строго различай слова «все» (множественное число: все зверята спят) и «всё» (средний род: всё вокруг стихло). Всегда ставь точки над «ё» там, где звук [йо]! "
+        "2. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО ставить знаки ударения (символ ́) над буквами! "
+        "3. Полностью избегай слов-омографов (замок, кружки, стрелки, белки, стоит, дорога, чудная). Вместо них используй ласковые уменьшительно-ласкательные слова с однозначным ударением: кроватка, подушечка, одеяльце, звёздочка, глазки, лапки, хвостик, носик, домик, огонёк. "
+        "4. Пиши короткими певучими предложениями (по 8-12 слов) без тире и без скобок, чтобы голос диктора лился плавно, как колыбельная."
+    )
+
+    if is_continuation:
+        context_block = (
+            f"Напиши новую серию (продолжение) вчерашней сказки на ночь.\n"
+            f"Данные: Ребенок = [{child}], Любимый персонаж = [{hero}], Событие новой серии = [{theme}].\n"
+            f"Краткое содержание прошлой серии: [{prev_summary}].\n"
+        )
+    else:
+        context_block = (
+            f"Сочини добрую, уютную, терапевтическую сказку на ночь для малыша.\n"
+            f"Данные: Ребенок = [{child}], Любимый друг = [{hero}], Тема = [{theme}].\n"
+        )
+
+    prompt = (
+        f"{system_rules}\n\n{context_block}\n"
+        f"Строгий формат ответа:\n"
+        f"1. Сама сказка объемом 160-200 слов, разделенная на 3 абзаца. В 3-м (финальном) абзаце обязательно проведи мягкий «Сонный Дыхательный Ритуал»: предложи малышу вместе с героем сделать глубокий сонный вдох носиком, сладко потянуться в тёплой кроватке, закрыть глазки и уснуть.\n"
+        f"2. С новой строки заголовок '💬 Вопросы для малыша перед сном:' и 2 ласковых вопроса по сюжету.\n"
+        f"3. С новой строки 'SUMMARY: ' и 1 предложение о том, что произошло.\n"
+        f"4. С новой строки 'TOMORROW_HOOK: ' и 1 интригующее сказочное предложение-анонс того, какое доброе чудо ждёт героя в завтрашней серии.\n"
+        f"5. На последней строке 'IMAGE_PROMPT: ' и детальное описание сцены и героя ({hero}) на АНГЛИЙСКОМ языке (15-22 слова) для художника Pixar/Disney (например: adorable fluffy white kitten wearing tiny striped pajamas sleeping on a glowing crescent moon pillow in a cozy wooden bedroom).\n"
+        f"Пиши без символов звездочек (*) и решеток (#)."
+    )
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.65, "maxOutputTokens": 4096},
+        "safetySettings": [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+        ]
+    }
+
+    session = await get_http_session()
+    last_error = "Неизвестная ошибка"
+
+    for k_offset in range(len(keys)):
+        key_idx = (current_key_index + k_offset) % len(keys)
+        api_key = keys[key_idx]
+        models = await fetch_available_models(session, api_key)
+
+        for model_path in models:
+            stream_url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:streamGenerateContent?alt=sse&key={api_key}"
+            try:
+                async def _do_stream_request(_attempt: int):
+                    accumulated = ""
+                    last_edit_ts = 0.0
+                    last_edited_len = 0
+                    edits_done = 0
+
+                    async with session.post(stream_url, json=payload) as resp:
+                        if resp.status != 200:
+                            raise RuntimeError(f"HTTP {resp.status}")
+
+                        async for raw_line in resp.content:
+                            line = raw_line.decode("utf-8", errors="ignore").strip()
+                            if not line.startswith("data:"):
+                                continue
+                            data_str = line[5:].strip()
+                            if not data_str or data_str == "[DONE]":
+                                continue
+                            try:
+                                chunk_json = json.loads(data_str)
+                                cands = chunk_json.get("candidates", [])
+                                if cands and "content" in cands[0]:
+                                    for p in cands[0]["content"].get("parts", []):
+                                        if "text" in p:
+                                            accumulated += p["text"]
+                            except Exception:
+                                continue
+
+                            now_ts = time.time()
+                            if now_ts - last_edit_ts >= 0.75 and len(accumulated) - last_edited_len >= 35:
+                                preview_clean, _, _, _, _ = strip_service_tags_and_clean(accumulated, hero, theme)
+                                if len(preview_clean) > 25:
+                                    try:
+                                        await live_message.edit_text(
+                                            f"📖 Сказка для: {child} (печатается... ✍️)\n\n{preview_clean[:3800]}"
+                                        )
+                                        last_edit_ts = now_ts
+                                        last_edited_len = len(accumulated)
+                                        edits_done += 1
+                                    except Exception:
+                                        pass
+                    return accumulated, edits_done
+
+                full_raw, edits_count = await retry_with_backoff(_do_stream_request, retries=2, base_delay=0.6, max_delay=2.5)
+                display_text, story_for_tts, summary, img_prompt, tomorrow_hook = strip_service_tags_and_clean(full_raw, hero, theme)
+                word_count = len(story_for_tts.split())
+
+                if word_count >= 50:
+                    current_key_index = key_idx
+                    if not is_continuation:
+                        save_story_to_cache(hero, theme, child, display_text, story_for_tts, summary, img_prompt, tomorrow_hook)
+                    return display_text, story_for_tts, summary, img_prompt, tomorrow_hook, edits_count
+                else:
+                    last_error = f"Короткий ответ ({word_count} слов)"
+            except Exception as e:
+                last_error = f"{model_path}: {str(e)[:60]}"
+                logging.warning(f"Переключение модели после: {last_error}")
+
+    raise RuntimeError(f"Серверы нейросети перегружены ({last_error}). Пожалуйста, попробуйте через минуту.")
+
+async def generate_illustration_image(english_prompt: str, art_style_key: str, image_path: str) -> tuple[bool, str]:
+    """
+    Генерирует премиальную иллюстрацию через движок FLUX в высоком разрешении (1024x1024)
+    с поддержкой JPEG, PNG и WebP (без дешёвых стоковых фото!).
+    """
+    clean_en = re.sub(r'[^a-zA-Z0-9 ,.-]', '', english_prompt).strip()[:180]
+    if len(clean_en) < 5:
+        clean_en = "cute adorable fluffy baby character sleeping peacefully on a glowing cloud pillow"
+
+    _, style_prompt_suffix = ART_STYLES.get(art_style_key, ART_STYLES["pixar"])
+    full_prompt = f"{clean_en}, {style_prompt_suffix}"
+    encoded_prompt = urllib.parse.quote(full_prompt)
+    seed = random.randint(10000, 999999)
+
+    flux_url_1 = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&seed={seed}&model=flux&enhance=true&nologo=true"
+    flux_url_2 = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&seed={seed+7}&model=flux&nologo=true"
+    turbo_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&seed={seed+13}&model=turbo&nologo=true"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "image/jpeg,image/png,image/webp,*/*;q=0.8"
+    }
+
+    session = await get_http_session()
+    for url in (flux_url_1, flux_url_2, turbo_url):
+        try:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=24.0)) as resp:
+                if resp.status == 200:
+                    content = await resp.read()
+                    is_valid_img = (
+                        content.startswith(b'\xff\xd8')
+                        or content.startswith(b'\x89PNG')
+                        or (content.startswith(b'RIFF') and b'WEBP' in content[:16])
+                    )
+                    if len(content) > 8000 and is_valid_img:
+                        with open(image_path, "wb") as f:
+                            f.write(content)
+                        logging.info(f"Премиальная иллюстрация FLUX успешно создана ({len(content)} байт)!")
+                        return True, url
+        except Exception as e:
+            logging.warning(f"Попытка рендера иллюстрации: {e}")
+
+    return False, flux_url_1
+
+async def send_illustration_guaranteed(message: Message, has_local_file: bool, image_path: str, flux_url: str, child: str, hero: str, style_key: str):
+    style_title = ART_STYLES.get(style_key, ART_STYLES["pixar"])[0]
+    caption = f"🎨 Иллюстрация для: {child}\n🧸 Герой: {hero} ({style_title})"
+    if has_local_file and os.path.exists(image_path):
+        try:
+            await message.answer_photo(photo=FSInputFile(image_path), caption=caption)
+            return
+        except Exception as e:
+            logging.warning(f"Ошибка отправки локального фото, пробуем прямой URL: {e}")
+
+    try:
+        await message.answer_photo(photo=URLInputFile(flux_url), caption=caption)
+    except Exception as e:
+        logging.warning(f"Не удалось отправить иллюстрацию по URL: {e}")
+
+async def generate_audio_natural(story_text_only: str, file_path: str, preferred_voice: str):
+    phonetic_text = prepare_russian_text_for_tts(story_text_only)
+    fallback_voices = [preferred_voice] + [v for v in AVAILABLE_VOICES.keys() if v != preferred_voice]
+
+    async with tts_semaphore:
+        for voice in fallback_voices:
+            try:
+                async def _save_edge_tts(_attempt: int):
+                    communicate = edge_tts.Communicate(phonetic_text, voice, rate="-7%")
+                    await asyncio.wait_for(communicate.save(file_path), timeout=28.0)
+                    if not os.path.exists(file_path) or os.path.getsize(file_path) < 5000:
+                        raise RuntimeError("Empty TTS file")
+
+                await retry_with_backoff(_save_edge_tts, retries=2, base_delay=0.7, max_delay=3.0)
+                return
+            except Exception as e:
+                logging.warning(f"Голос {voice} пропустил ход: {e}")
+
+        loop = asyncio.get_running_loop()
+        def _run_gtts():
+            tts = gTTS(text=phonetic_text, lang='ru', slow=False)
+            tts.save(file_path)
+        await loop.run_in_executor(tts_thread_pool, _run_gtts)
+
+# ==========================================
+# 10. ФОНОВАЯ ОЧЕРЕДЬ ЗАДАЧ И ВОРКЕРЫ
+# ==========================================
+@dataclass
+class StoryJob:
+    message: Message
+    status_msg: Message
+    user_id: int
+    child: str
+    hero: str
+    theme_text: str
+    is_continuation: bool
+    prev_summary: str
+
+async def enqueue_story_job(
+    message: Message,
+    user_id: int,
+    child: str,
+    hero: str,
+    theme_text: str,
+    is_continuation: bool,
+    prev_summary: str
+):
+    if user_id in active_generations:
+        await message.answer("⏳ Ваша сказка уже находится в работе, подождите пару секунд...")
+        return
+
+    wait_sec = await check_distributed_rate_limit(user_id)
+    if wait_sec > 0:
+        await message.answer(f"⏳ Пожалуйста, подождите {wait_sec} сек. перед следующим запросом.")
+        return
+
+    balance, _, _, _, _, _, _, _, _, _, _ = get_user_data(user_id)
+    if balance <= 0:
+        await message.answer("🌙 Сказки на балансе закончились! Пополните баланс:", reply_markup=get_tariffs_inline_kb())
+        return
+
+    active_generations.add(user_id)
+    q_waiting = story_task_queue.qsize() if story_task_queue else 0
+    queue_note = f" (Ваш номер в очереди: {q_waiting + 1})" if q_waiting >= NUM_QUEUE_WORKERS else ""
+
+    status_msg = await message.answer(
+        f"✨ Волшебное перо начинает писать сказку для: {child}...{queue_note}",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+    job = StoryJob(
+        message=message,
+        status_msg=status_msg,
+        user_id=user_id,
+        child=child,
+        hero=hero,
+        theme_text=theme_text,
+        is_continuation=is_continuation,
+        prev_summary=prev_summary
+    )
+    await story_task_queue.put(job)
+
+async def process_single_story_job(job: StoryJob):
+    user_id = job.user_id
+    unique_tag = f"{user_id}_{int(time.time() * 1000)}"
+    audio_path = f"/tmp/story_{unique_tag}.mp3" if os.path.exists("/tmp") else f"story_{unique_tag}.mp3"
+    image_path = f"/tmp/img_{unique_tag}.jpg" if os.path.exists("/tmp") else f"img_{unique_tag}.jpg"
+
+    try:
+        _, _, _, _, _, preferred_voice, _, _, _, art_style, _ = get_user_data(user_id)
+
+        async with ChatActionSender.typing(bot=bot, chat_id=job.message.chat.id):
+            display_text, story_for_tts, new_summary, img_prompt, tomorrow_hook, edits_done = await stream_and_generate_story_bundle(
+                job.child, job.hero, job.theme_text, job.is_continuation, job.prev_summary, job.status_msg
+            )
+
+        async with ChatActionSender.record_voice(bot=bot, chat_id=job.message.chat.id):
+            _, (has_local_img, flux_url), _ = await asyncio.gather(
+                animate_streaming_text_for_user(job.status_msg, job.child, display_text, edits_done),
+                generate_illustration_image(img_prompt, art_style, image_path),
+                generate_audio_natural(story_for_tts, audio_path, preferred_voice)
+            )
+
+        await send_illustration_guaranteed(
+            job.message, has_local_img, image_path, flux_url, job.child, job.hero, art_style
+        )
+
+        voice_file = FSInputFile(audio_path)
+        remaining, total_gen = update_user_after_story(user_id, job.child, job.hero, new_summary, tomorrow_hook)
+        rank_title = get_child_rank(total_gen)
+
+        hook_teaser = f"\n🔮 В следующей серии: «{tomorrow_hook}»\n" if tomorrow_hook else "\n"
+
+        await job.message.answer_voice(
+            voice=voice_file,
+            caption=(
+                f"🎧 Аудиосказка про героя ({job.hero}) готова!\n"
+                f"🏅 Титул малыша: {rank_title}\n"
+                f"{hook_teaser}"
+                f"🎁 Осталось сказок на балансе: {remaining} шт."
+            ),
+            reply_markup=get_post_story_inline_kb()
+        )
+
+        # Smart Upsell (Фишка Билла Гейтса): если на балансе осталась 0 или 1 сказка, мягко предлагаем пополнить под интригу завтрашней серии
+        if remaining <= 1 and tomorrow_hook:
+            await job.message.answer(
+                f"💡 Совет перед сном: у вас осталась {remaining} сказка на балансе.\n"
+                f"Чтобы завтра вечером малыш сразу узнал продолжение («{tomorrow_hook}»), вы можете пополнить баланс заранее:",
+                reply_markup=get_tariffs_inline_kb()
+            )
+        else:
+            await job.message.answer("Главное меню:", reply_markup=main_menu_keyboard)
+
+    except Exception as e:
+        await report_error_to_admin("Story Worker Error", e)
+        await job.message.answer(
+            f"⚠️ {str(e)[:350]}\n\n(Попытка сохранена на вашем балансе)",
+            reply_markup=main_menu_keyboard
+        )
+    finally:
+        active_generations.discard(user_id)
+        for p in (audio_path, image_path):
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+async def story_worker_loop(worker_id: int):
+    logging.info(f"Фоновый воркер очереди #{worker_id} запущен.")
+    while True:
+        job: StoryJob = await story_task_queue.get()
+        try:
+            await process_single_story_job(job)
+        except Exception as e:
+            logging.error(f"Сбой воркера #{worker_id}: {e}")
+        finally:
+            story_task_queue.task_done()
+
+# ==========================================
+# 11. ВЕБ-СЕРВЕР RENDER С ПОДДЕРЖКОЙ WEBHOOKS И HEALTHCHECK
+# ==========================================
+async def handle_ping(request):
+    return web.Response(text="OK - FairyTale Bot Enterprise is running")
+
+async def handle_telegram_webhook(request: web.Request):
+    secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if secret_header != WEBHOOK_SECRET:
+        return web.Response(status=403, text="Forbidden")
+    try:
+        data = await request.json()
+        update = Update.model_validate(data, context={"bot": bot})
+        asyncio.create_task(dp.feed_update(bot, update))
+    except Exception as e:
+        logging.error(f"Ошибка обработки Webhook: {e}")
+    return web.Response(text="OK")
+
+async def start_server():
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    app.router.add_get('/health', handle_ping)
+    app.router.add_post(WEBHOOK_PATH, handle_telegram_webhook)
+
+    port = int(os.environ.get("PORT", 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logging.info(f"WEB SERVER BOUND TO PORT {port}")
+    return runner
+
+async def main():
+    global story_task_queue
+    logging.info("ЗАПУСК БОТА...")
+    init_db()
+    story_task_queue = asyncio.Queue()
+
+    server_runner = await start_server()
+
+    worker_tasks = [asyncio.create_task(story_worker_loop(i + 1)) for i in range(NUM_QUEUE_WORKERS)]
+    scheduler_task = asyncio.create_task(bedtime_reminder_scheduler())
+
+    try:
+        if WEBHOOK_BASE_URL:
+            full_webhook_url = f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
+            await bot.set_webhook(
+                url=full_webhook_url,
+                secret_token=WEBHOOK_SECRET,
+                drop_pending_updates=True,
+                allowed_updates=dp.resolve_used_update_types()
+            )
+            logging.info(f"РЕЖИМ WEBHOOK АКТИВИРОВАН: {full_webhook_url}")
+            await asyncio.Event().wait()
+        else:
+            logging.info("RENDER_EXTERNAL_URL не обнаружен, переключение на Long Polling...")
+            await asyncio.sleep(5)
+            await bot.delete_webhook(drop_pending_updates=True)
+            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        for t in worker_tasks:
+            t.cancel()
+        scheduler_task.cancel()
+        tts_thread_pool.shutdown(wait=False)
+        if http_session and not http_session.closed:
+            await http_session.close()
+        await bot.session.close()
+        await server_runner.cleanup()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Bot stopped.")

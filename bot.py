@@ -3,6 +3,7 @@ import sys
 import re
 import math
 import wave
+import json
 import time
 import struct
 import random
@@ -14,7 +15,6 @@ import logging
 import traceback
 import subprocess
 from contextlib import contextmanager
-from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
@@ -68,6 +68,7 @@ WEBHOOK_SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:32]
 DB_PATH = os.environ.get("DATABASE_PATH") or (
     "/tmp/users.db" if os.path.exists("/tmp") else "users.db"
 )
+STORIES_JSON_PATH = os.environ.get("STORIES_JSON_PATH", "stories.json")
 LULLABY_WAV_PATH = (
     "/tmp/lullaby_loop_bg.wav" if os.path.exists("/tmp") else "lullaby_loop_bg.wav"
 )
@@ -88,22 +89,21 @@ current_key_index = 0
 cached_models_by_key = {}
 http_session = None
 
-# Единый добрый промокод на 5 сказок (принимает и кириллицу, и латиницу)
 VALID_PROMO_ALIASES = {"DOBRO", "ДОБРО"}
 PROMO_BONUS_STORIES = 5
 
 FREE_START_STORIES = 3
 REFERRAL_BONUS_STORIES = 2
 MAX_CHILDREN_PER_FAMILY = 3
+CLASSICS_PAGE_SIZE = 8
 
-# Тарифная сетка: 99 ₽ = 50 ⭐ | 199 ₽ = 100 ⭐ | 499 ₽ (Месяц) = 250 ⭐
 TARIFFS = {
     "pack_5": {
         "stories": 5,
         "days": 0,
         "stars": 50,
         "rub": 99,
-        "title": "Пакет: 5 добрых сказок",
+        "title": "Пакет: 5 авторских сказок",
         "btn_text": "✨ 5 сказок — 99 ₽ (50 ⭐)"
     },
     "pack_15": {
@@ -111,7 +111,7 @@ TARIFFS = {
         "days": 0,
         "stars": 100,
         "rub": 199,
-        "title": "Пакет: 15 добрых сказок (Выгодно)",
+        "title": "Пакет: 15 авторских сказок (Выгодно)",
         "btn_text": "🔥 15 сказок — 199 ₽ (100 ⭐)"
     },
     "sub_month": {
@@ -147,14 +147,6 @@ VOICE_PREVIEW_TEXTS = {
     )
 }
 
-TIMEZONE_OFFSETS = {
-    "3": ("Москва (UTC+3)", 3),
-    "5": ("Екатеринбург (UTC+5)", 5),
-    "7": ("Новосибирск (UTC+7)", 7),
-    "8": ("Иркутск (UTC+8)", 8),
-    "10": ("Владивосток (UTC+10)", 10),
-}
-
 def get_all_gemini_keys():
     keys = []
     candidates = [
@@ -187,7 +179,6 @@ def sanitize_input(text, max_len=70):
     return cleaned[:max_len]
 
 def extract_clean_name(child_info):
-    """Извлекает чистое имя из строки вида 'Миша, 4 года' -> 'Миша' для красивых заголовков."""
     if not child_info:
         return "Малыш"
     first_part = re.split(r'[,(\d]', child_info)[0].strip()
@@ -198,6 +189,10 @@ def is_admin(user_id):
 
 def check_rate_limit(user_id):
     now = time.time()
+    if len(user_cooldowns) > 1000:
+        expired = [k for k, v in user_cooldowns.items() if now - v > COOLDOWN_SECONDS * 2]
+        for k in expired:
+            user_cooldowns.pop(k, None)
     last_time = user_cooldowns.get(user_id, 0)
     if now - last_time < COOLDOWN_SECONDS:
         return int(COOLDOWN_SECONDS - (now - last_time)) + 1
@@ -240,13 +235,13 @@ async def retry_with_backoff(coro_factory, retries=3, base_delay=0.7, max_delay=
     raise last_exc
 
 # ==========================================
-# 3. БАЗА ДАННЫХ SQLITE
+# 3. БАЗА ДАННЫХ SQLITE И ВНЕШНЯЯ БАЗА STORIES.JSON
 # ==========================================
 @contextmanager
 def get_db_connection():
     conn = sqlite3.connect(DB_PATH, timeout=15.0)
-    conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=15000;")
     try:
         yield conn
     finally:
@@ -254,6 +249,7 @@ def get_db_connection():
 
 def init_db():
     with get_db_connection() as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -265,9 +261,6 @@ def init_db():
                 voice TEXT DEFAULT 'ru-RU-SvetlanaNeural',
                 referred_by INTEGER DEFAULT 0,
                 referrals_count INTEGER DEFAULT 0,
-                remind_time TEXT DEFAULT '',
-                tz_offset INTEGER DEFAULT 3,
-                last_reminded_date TEXT DEFAULT '',
                 tomorrow_hook TEXT DEFAULT '',
                 bg_music INTEGER DEFAULT 1,
                 sub_until INTEGER DEFAULT 0,
@@ -302,6 +295,21 @@ def init_db():
                 file_id TEXT
             )
         ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS classic_audio_cache (
+                cache_key TEXT PRIMARY KEY,
+                file_id TEXT
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS custom_classics (
+                story_uid TEXT PRIMARY KEY,
+                title TEXT,
+                author TEXT,
+                story_text TEXT,
+                sort_order INTEGER DEFAULT 0
+            )
+        ''')
 
         existing_cols = [
             row[1] for row in conn.execute("PRAGMA table_info(users);").fetchall()
@@ -313,9 +321,6 @@ def init_db():
             "voice": "TEXT DEFAULT 'ru-RU-SvetlanaNeural'",
             "referred_by": "INTEGER DEFAULT 0",
             "referrals_count": "INTEGER DEFAULT 0",
-            "remind_time": "TEXT DEFAULT ''",
-            "tz_offset": "INTEGER DEFAULT 3",
-            "last_reminded_date": "TEXT DEFAULT ''",
             "tomorrow_hook": "TEXT DEFAULT ''",
             "bg_music": "INTEGER DEFAULT 1",
             "sub_until": "INTEGER DEFAULT 0",
@@ -351,6 +356,134 @@ def init_db():
                 )
         conn.commit()
 
+CLASSICS_CATALOG = {}
+_LAST_JSON_MTIME = None
+
+def _normalize_story_entry(item):
+    if not isinstance(item, dict):
+        return None
+    title = str(item.get("title") or "").strip()
+    text = str(item.get("text") or "").strip()
+    if not title or not text:
+        return None
+    author = str(item.get("author") or "Добрая классика").strip()
+    raw_uid = str(item.get("id") or title).strip().lower()
+    uid_hash = hashlib.md5(raw_uid.encode("utf-8")).hexdigest()[:10]
+    text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
+    return {
+        "uid": f"s_{uid_hash}",
+        "title": title,
+        "author": author,
+        "text": text,
+        "text_hash": text_hash
+    }
+
+def load_all_classics(force=False):
+    """Динамически синхронизирует сказки из файла stories.json и таблицы SQLite custom_classics."""
+    global CLASSICS_CATALOG, _LAST_JSON_MTIME
+
+    file_exists = os.path.exists(STORIES_JSON_PATH)
+    current_mtime = os.path.getmtime(STORIES_JSON_PATH) if file_exists else None
+
+    if not force and CLASSICS_CATALOG and current_mtime == _LAST_JSON_MTIME:
+        return CLASSICS_CATALOG
+
+    merged_by_uid = {}
+    order_counter = 0
+
+    if file_exists:
+        try:
+            with open(STORIES_JSON_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    for item in data:
+                        norm = _normalize_story_entry(item)
+                        if norm:
+                            order_counter += 1
+                            norm["order"] = order_counter
+                            merged_by_uid[norm["uid"]] = norm
+        except Exception as e:
+            logging.warning(f"Ошибка чтения {STORIES_JSON_PATH}: {e}")
+
+    try:
+        with get_db_connection() as conn:
+            rows = conn.execute(
+                "SELECT story_uid, title, author, story_text, sort_order "
+                "FROM custom_classics ORDER BY sort_order ASC"
+            ).fetchall()
+            for s_uid, title, author, s_text, s_order in rows:
+                norm = _normalize_story_entry({
+                    "id": s_uid,
+                    "title": title,
+                    "author": author,
+                    "text": s_text
+                })
+                if norm:
+                    order_counter += 1
+                    norm["order"] = s_order or order_counter
+                    merged_by_uid[norm["uid"]] = norm
+    except Exception as e:
+        logging.warning(f"Ошибка чтения custom_classics из БД: {e}")
+
+    CLASSICS_CATALOG = merged_by_uid
+    _LAST_JSON_MTIME = current_mtime
+
+    if not file_exists and CLASSICS_CATALOG:
+        export_classics_to_json_file()
+
+    logging.info(f"Каталог классических сказок активен: {len(CLASSICS_CATALOG)} шт.")
+    return CLASSICS_CATALOG
+
+def export_classics_to_json_file():
+    """Записывает актуальный каталог классических сказок в файл stories.json."""
+    try:
+        export_list = []
+        for idx, item in enumerate(CLASSICS_CATALOG.values(), start=1):
+            export_list.append({
+                "id": f"story_{idx}",
+                "title": item["title"],
+                "author": item["author"],
+                "text": item["text"]
+            })
+        with open(STORIES_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(export_list, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.warning(f"Не удалось записать {STORIES_JSON_PATH}: {e}")
+
+def import_stories_from_list(raw_list, replace_all=False):
+    """Импортирует список сказок в SQLite и синхронизирует их с файлом stories.json."""
+    valid_entries = []
+    for item in raw_list:
+        norm = _normalize_story_entry(item)
+        if norm:
+            valid_entries.append(norm)
+
+    if not valid_entries:
+        raise ValueError("В файле не найдено ни одной сказки с обязательными полями 'title' и 'text'.")
+
+    with get_db_connection() as conn:
+        if replace_all:
+            conn.execute("DELETE FROM custom_classics")
+        for idx, entry in enumerate(valid_entries, start=1):
+            conn.execute(
+                """INSERT OR REPLACE INTO custom_classics 
+                   (story_uid, title, author, story_text, sort_order) 
+                   VALUES (?, ?, ?, ?, ?)""",
+                (entry["uid"], entry["title"], entry["author"], entry["text"], idx)
+            )
+        conn.commit()
+
+    if replace_all and os.path.exists(STORIES_JSON_PATH):
+        try:
+            os.remove(STORIES_JSON_PATH)
+        except Exception:
+            pass
+
+    load_all_classics(force=True)
+    export_classics_to_json_file()
+    load_all_classics(force=True)
+    return len(valid_entries), len(CLASSICS_CATALOG)
+
 def get_cached_voice_sample(voice_id, bg_music):
     key = f"{voice_id}::bg_{bg_music}"
     with get_db_connection() as conn:
@@ -364,6 +497,27 @@ def save_cached_voice_sample(voice_id, bg_music, file_id):
     with get_db_connection() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO voice_samples (sample_key, file_id) VALUES (?, ?)",
+            (key, file_id)
+        )
+        conn.commit()
+
+def make_classic_cache_key(classic_id, text_hash, clean_name, hero, voice_id, bg_music):
+    raw = f"{classic_id}::{text_hash}::{clean_name.lower()}::{hero.lower()}::{voice_id}::{bg_music}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+def get_cached_classic_audio(classic_id, text_hash, clean_name, hero, voice_id, bg_music):
+    key = make_classic_cache_key(classic_id, text_hash, clean_name, hero, voice_id, bg_music)
+    with get_db_connection() as conn:
+        row = conn.execute("SELECT file_id FROM classic_audio_cache WHERE cache_key = ?", (key,)).fetchone()
+        return row[0] if row else ""
+
+def save_cached_classic_audio(classic_id, text_hash, clean_name, hero, voice_id, bg_music, file_id):
+    if not file_id:
+        return
+    key = make_classic_cache_key(classic_id, text_hash, clean_name, hero, voice_id, bg_music)
+    with get_db_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO classic_audio_cache (cache_key, file_id) VALUES (?, ?)",
             (key, file_id)
         )
         conn.commit()
@@ -493,7 +647,7 @@ def register_or_get_user(user_id, referrer_id=0, utm_source=""):
         c = conn.cursor()
         c.execute(
             """SELECT stories_left, total_generated, last_child, last_hero, 
-                      last_story_summary, voice, referrals_count, remind_time, tz_offset,
+                      last_story_summary, voice, referrals_count,
                       tomorrow_hook, bg_music
                FROM users WHERE user_id = ?""",
             (user_id,)
@@ -517,36 +671,35 @@ def register_or_get_user(user_id, referrer_id=0, utm_source=""):
                 """INSERT INTO users 
                    (user_id, stories_left, total_generated, last_child, last_hero, 
                     last_story_summary, voice, referred_by, referrals_count, 
-                    remind_time, tz_offset, tomorrow_hook, bg_music, utm_source) 
-                   VALUES (?, ?, 0, '', '', '', ?, ?, 0, '', 3, '', 1, ?)""",
+                    tomorrow_hook, bg_music, utm_source) 
+                   VALUES (?, ?, 0, '', '', '', ?, ?, 0, '', 1, ?)""",
                 (user_id, FREE_START_STORIES, DEFAULT_VOICE, valid_ref, utm_source[:40])
             )
             conn.commit()
             return (
                 FREE_START_STORIES, 0, "", "", "", DEFAULT_VOICE,
-                0, "", 3, "", 1, ref_rewarded
+                0, "", 1, ref_rewarded
             )
 
         voice_val = row[5] if (row[5] in AVAILABLE_VOICES) else DEFAULT_VOICE
         return (
             row[0], row[1], row[2] or "", row[3] or "",
             row[4] or "", voice_val, row[6] or 0,
-            row[7] or "", row[8] if row[8] is not None else 3,
-            row[9] or "", 1 if (row[10] is None or row[10] == 1) else 0,
+            row[7] or "", 1 if (row[8] is None or row[8] == 1) else 0,
             False
         )
 
 def get_user_data(user_id):
-    """Возвращает: (balance, total, child, hero, summary, voice, refs, remind_time, tz_offset, tomorrow_hook, bg_music)"""
+    """Возвращает 9 элементов: (balance, total, child, hero, summary, voice, refs, tomorrow_hook, bg_music)"""
     data = register_or_get_user(user_id)
     active_prof = get_active_child_profile(user_id)
     if active_prof:
         _, c_name, h_name, l_sum, t_hook, _, _ = active_prof
         return (
             data[0], data[1], c_name, h_name, l_sum,
-            data[5], data[6], data[7], data[8], t_hook, data[10]
+            data[5], data[6], t_hook, data[8]
         )
-    return data[:11]
+    return (data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8])
 
 def set_user_voice(user_id, voice_id):
     _ = get_user_data(user_id)
@@ -556,26 +709,11 @@ def set_user_voice(user_id, voice_id):
 
 def toggle_user_bg_music(user_id):
     data = get_user_data(user_id)
-    new_val = 0 if data[10] == 1 else 1
+    new_val = 0 if data[8] == 1 else 1
     with get_db_connection() as conn:
         conn.execute("UPDATE users SET bg_music = ? WHERE user_id = ?", (new_val, user_id))
         conn.commit()
     return new_val
-
-def set_user_reminder(user_id, remind_time, tz_offset=None):
-    _ = get_user_data(user_id)
-    with get_db_connection() as conn:
-        if tz_offset is not None:
-            conn.execute(
-                "UPDATE users SET remind_time = ?, tz_offset = ? WHERE user_id = ?",
-                (remind_time, tz_offset, user_id)
-            )
-        else:
-            conn.execute(
-                "UPDATE users SET remind_time = ? WHERE user_id = ?",
-                (remind_time, user_id)
-            )
-        conn.commit()
 
 def update_user_after_story(user_id, child, hero, summary, tomorrow_hook):
     save_or_activate_child_profile(user_id, child, hero)
@@ -620,6 +758,14 @@ def update_user_after_story(user_id, child, hero, summary, tomorrow_hook):
         rem = row[0] if row else 0
         tot = row[1] if row else 1
     return rem, tot
+
+def increment_classic_counter(user_id):
+    with get_db_connection() as conn:
+        conn.execute(
+            "UPDATE users SET total_generated = total_generated + 1 WHERE user_id = ?",
+            (user_id,)
+        )
+        conn.commit()
 
 def add_stories_to_user(user_id, count):
     _ = get_user_data(user_id)
@@ -694,10 +840,11 @@ def get_global_stats():
         stories_cnt = c.execute("SELECT COALESCE(SUM(total_generated), 0) FROM users").fetchone()[0]
         pay_cnt = c.execute("SELECT COUNT(*) FROM payments").fetchone()[0]
         stars_sum = c.execute("SELECT COALESCE(SUM(stars_amount), 0) FROM payments").fetchone()[0]
+        classic_cached = c.execute("SELECT COUNT(*) FROM classic_audio_cache").fetchone()[0]
         utm_rows = c.execute(
             "SELECT utm_source, COUNT(*) FROM users WHERE utm_source != '' GROUP BY utm_source ORDER BY COUNT(*) DESC LIMIT 5"
         ).fetchall()
-        return users_cnt, profiles_cnt, stories_cnt, pay_cnt, stars_sum, utm_rows
+        return users_cnt, profiles_cnt, stories_cnt, pay_cnt, stars_sum, classic_cached, utm_rows
 
 async def send_db_backup_to_admin(reason="Плановый бэкап"):
     if ADMIN_ID == 0 or not os.path.exists(DB_PATH):
@@ -713,9 +860,8 @@ async def send_db_backup_to_admin(reason="Плановый бэкап"):
         logging.warning(f"Не удалось отправить бэкап админу: {e}")
 
 # ==========================================
-# 4. РУССКАЯ ОРФОЭПИЯ (РЕШЕНИЕ ПРОБЛЕМЫ УДАРЕНИЙ)
+# 4. РУССКАЯ ОРФОЭПИЯ (КОНТРОЛЬ УДАРЕНИЙ)
 # ==========================================
-# 1. Полный словарь ёфикации для детских сказок
 YO_WORDS_DICT = {
     "котенок": "котёнок", "котенка": "котёнка", "котенку": "котёнку", "котенком": "котёнком", "котенке": "котёнке",
     "лисенок": "лисёнок", "лисенка": "лисёнка", "лисенку": "лисёнку", "лисенком": "лисёнком",
@@ -754,11 +900,11 @@ YO_WORDS_DICT = {
     "узнает": "узнаёт", "встает": "встаёт", "отдает": "отдаёт", "дает": "даёт", "создает": "создаёт",
     "вперед": "вперёд", "полет": "полёт", "самолет": "самолёт", "самолетик": "самолётик", "вертолет": "вертолёт",
     "колеса": "колёса", "колесики": "колёсики", "колесами": "колёсами",
-    "пестрый": "пёстрый", "пестрая": "пёстрая", "пестрое": "пёстрое",
+    "пестрый": "пёстрый", "пестрая": "пёстрая", "пестрое": "пёстрое", "пестрые": "пёстрые",
     "желтый": "жёлтый", "желтая": "жёлтая", "желтое": "жёлтое", "желтые": "жёлтые", "желтым": "жёлтым", "желтой": "жёлтой",
     "зеленый": "зелёный", "зеленая": "зелёная", "зеленое": "зелёное", "зеленые": "зелёные",
     "зеленым": "зелёным", "зеленой": "зелёной", "зеленом": "зелёном", "зеленую": "зелёную",
-    "береза": "берёза", "березка": "берёзка", "березки": "берёзки", "березке": "берёзке",
+    "береза": "берёза", "березка": "берёзка", "березки": "берёзки", "березке": "берёзке", "берез": "берёз",
     "клен": "клён", "клена": "клёна", "черемуха": "черёмуха", "пеленки": "пелёнки",
     "ребенок": "ребёнок", "ребенка": "ребёнка", "ребенку": "ребёнку", "ребенком": "ребёнком",
     "огонек": "огонёк", "огоньки": "огоньки", "еще": "ещё",
@@ -772,10 +918,9 @@ YO_WORDS_DICT = {
     "зернышко": "зёрнышко", "зернышки": "зёрнышки", "гнездышко": "гнёздышко", "ведерко": "ведёрко",
     "стеклышко": "стёклышко", "веревочка": "верёвочка", "тетя": "тётя", "тетушка": "тётушка",
     "сестры": "сёстры", "сестренка": "сестрёнка", "сестренки": "сестрёнки",
-    "костер": "костёр", "шатер": "шатёр", "бобер": "бобёр", "осел": "осёл"
+    "костер": "костёр", "шатер": "шатёр", "бобер": "бобёр", "осел": "осёл", "ученый": "учёный", "днем": "днём"
 }
 
-# 2. Словарь замены слов-омографов, в которых TTS ошибается с ударением
 HOMOGRAPH_REPLACEMENTS = {
     "чудный": "чудесный", "чудная": "чудесная", "чудное": "чудесное", "чудные": "чудесные", "чудным": "чудесным",
     "белки": "белочки", "белок": "белочек",
@@ -809,6 +954,7 @@ YO_CONTEXT_PHRASES = [
     ("во всем теле", "во всём теле"),
     ("во всем мире", "во всём мире"),
     ("во всем доме", "во всём доме"),
+    ("во всем дворе", "во всём дворе"),
     ("во всем лесу", "во всём лесу"),
     ("обо всем", "обо всём"),
     ("при всем", "при всём"),
@@ -824,6 +970,7 @@ YO_CONTEXT_PHRASES = [
     ("все затихло", "всё затихло"),
     ("все уснуло", "всё уснуло"),
     ("все готово", "всё готово"),
+    ("все ходит", "всё ходит"),
     ("это все", "это всё"),
     ("вот и все", "вот и всё"),
     ("о чем", "о чём"),
@@ -835,25 +982,15 @@ YO_CONTEXT_PHRASES = [
 ]
 
 def prepare_russian_text_for_tts(text):
-    """Нормализует текст для идеального русского произношения и правильных ударений."""
-    # Убираем знаки ударения (Edge-TTS читает их по слогам с искажением)
     result = text.replace("\u0301", "").replace("́", "")
-
-    # Заменяем слова-омографы на однозначные синонимы
     result = HOMOGRAPH_REGEX_PATTERN.sub(
         lambda m: _replace_preserving_case(m, HOMOGRAPH_REPLACEMENTS), result
     )
-
-    # Применяем контекстные фразы с «ё»
     for old_p, new_p in YO_CONTEXT_PHRASES:
         result = re.sub(re.escape(old_p), new_p, result, flags=re.IGNORECASE)
-
-    # Применяем словарь ёфикации
     result = YO_REGEX_PATTERN.sub(
         lambda m: _replace_preserving_case(m, YO_WORDS_DICT), result
     )
-
-    # Очищаем пунктуацию для плавных пауз диктора
     result = re.sub(r'\.{2,}', '.', result)
     result = re.sub(r'\s*[—–-]\s*', ', ', result)
     result = re.sub(r'[«»"“”()]', '', result)
@@ -892,7 +1029,6 @@ def synthesize_lullaby_loop_wav(wav_path=LULLABY_WAV_PATH, duration_sec=24):
         wf.writeframes(frames)
 
 def finalize_audio_with_lullaby_sync(raw_voice_path, final_audio_path, use_bg_music=1):
-    """Склеивает голос с колыбельной шкатулкой в нативный формат OGG Opus."""
     if not shutil.which("ffmpeg"):
         shutil.move(raw_voice_path, final_audio_path)
         return
@@ -917,7 +1053,7 @@ def finalize_audio_with_lullaby_sync(raw_voice_path, final_audio_path, use_bg_mu
                 final_audio_path
             ]
 
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=25)
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45)
         if res.returncode == 0 and os.path.exists(final_audio_path) and os.path.getsize(final_audio_path) > 3000:
             return
     except Exception as e:
@@ -926,7 +1062,6 @@ def finalize_audio_with_lullaby_sync(raw_voice_path, final_audio_path, use_bg_mu
     shutil.move(raw_voice_path, final_audio_path)
 
 async def synthesize_speech_to_file(text_to_read, final_audio_path, voice_id, use_bg_music=1):
-    """Генерирует русскую речь через Edge-TTS с проверкой орфоэпии и наложением шкатулки."""
     phonetic_text = prepare_russian_text_for_tts(text_to_read)
     raw_mp3_path = f"{final_audio_path}_raw.mp3"
     chosen_voice = voice_id if voice_id in AVAILABLE_VOICES else DEFAULT_VOICE
@@ -935,7 +1070,7 @@ async def synthesize_speech_to_file(text_to_read, final_audio_path, voice_id, us
         async with tts_semaphore:
             async def _do_tts(_attempt):
                 communicate = edge_tts.Communicate(phonetic_text, chosen_voice, rate="-6%")
-                await asyncio.wait_for(communicate.save(raw_mp3_path), timeout=40.0)
+                await asyncio.wait_for(communicate.save(raw_mp3_path), timeout=60.0)
                 if not os.path.exists(raw_mp3_path) or os.path.getsize(raw_mp3_path) < 2000:
                     raise RuntimeError("Пустой аудиофайл от TTS")
 
@@ -954,7 +1089,7 @@ async def synthesize_speech_to_file(text_to_read, final_audio_path, voice_id, us
                 pass
 
 # ==========================================
-# 6. КЛАВИАТУРЫ И ИНТЕРФЕЙС
+# 6. КЛАВИАТУРЫ И ИНТЕРФЕЙС (С ПАГИНАЦИЕЙ)
 # ==========================================
 class StoryCreation(StatesGroup):
     waiting_for_child_info = State()
@@ -965,9 +1100,9 @@ class StoryCreation(StatesGroup):
 
 main_menu_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🪄 Создать новую сказку"), KeyboardButton(text="🔄 Продолжить сказку")],
-        [KeyboardButton(text="🧸 Сказкотерапия (страхи/сон)"), KeyboardButton(text="👶 Профили детей")],
-        [KeyboardButton(text="🎙 Голос и музыка"), KeyboardButton(text="⏰ Время спать")],
+        [KeyboardButton(text="🪄 Создать новую сказку"), KeyboardButton(text="📚 Золотая классика")],
+        [KeyboardButton(text="🔄 Продолжить сказку"), KeyboardButton(text="🧸 Сказкотерапия (страхи/сон)")],
+        [KeyboardButton(text="👶 Профили детей"), KeyboardButton(text="🎙 Голос и музыка")],
         [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="💎 Тарифы и Подписка")]
     ],
     resize_keyboard=True
@@ -993,6 +1128,33 @@ therapy_keyboard = ReplyKeyboardMarkup(
     one_time_keyboard=True
 )
 
+def get_classics_inline_kb(page=0):
+    items = list(CLASSICS_CATALOG.items())
+    total_items = len(items)
+    if total_items == 0:
+        return InlineKeyboardMarkup(inline_keyboard=[])
+
+    total_pages = max(1, math.ceil(total_items / CLASSICS_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * CLASSICS_PAGE_SIZE
+    end_idx = start_idx + CLASSICS_PAGE_SIZE
+
+    rows = []
+    for cid, item in items[start_idx:end_idx]:
+        rows.append([InlineKeyboardButton(text=item["title"][:60], callback_data=f"classic_{cid}")])
+
+    if total_pages > 1:
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"cpage_{page - 1}"))
+        nav_row.append(InlineKeyboardButton(text=f"📄 {page + 1}/{total_pages}", callback_data="cpage_noop"))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"cpage_{page + 1}"))
+        rows.append(nav_row)
+
+    rows.append([InlineKeyboardButton(text="🎲 Случайная классическая сказка", callback_data="classic_random")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 def get_tariffs_inline_kb():
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1004,15 +1166,24 @@ def get_tariffs_inline_kb():
         ]
     )
 
-def get_post_story_inline_kb():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Продолжить эту историю", callback_data="action_continue")],
-            [InlineKeyboardButton(text="🎲 Новая тема с этим же героем", callback_data="action_same_hero")],
-            [InlineKeyboardButton(text="👶 Сменить профиль ребёнка", callback_data="manage_children")],
-            [InlineKeyboardButton(text="🎁 +2 сказки за друга", callback_data="ref_program")]
-        ]
-    )
+def get_post_story_inline_kb(is_classic=False):
+    if is_classic:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📚 Выбрать другую классику", callback_data="open_classics")],
+                [InlineKeyboardButton(text="🪄 Сочинить авторскую сказку про малыша", callback_data="action_same_hero")],
+                [InlineKeyboardButton(text="🎁 +2 сказки за друга", callback_data="ref_program")]
+            ]
+        )
+    rows = [
+        [InlineKeyboardButton(text="🔄 Продолжить эту историю", callback_data="action_continue")],
+        [InlineKeyboardButton(text="🎲 Новая тема с этим же героем", callback_data="action_same_hero")]
+    ]
+    if CLASSICS_CATALOG:
+        rows.append([InlineKeyboardButton(text="📚 Послушать Золотую классику", callback_data="open_classics")])
+    rows.append([InlineKeyboardButton(text="👶 Сменить профиль ребёнка", callback_data="manage_children")])
+    rows.append([InlineKeyboardButton(text="🎁 +2 сказки за друга", callback_data="ref_program")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def get_family_profiles_inline_kb(user_id):
     profiles = get_family_profiles(user_id)
@@ -1031,7 +1202,6 @@ def get_family_profiles_inline_kb(user_id):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def get_voice_and_music_kb(current_voice, bg_music=1):
-    """Клавиатура выбора голоса с кнопками предварительного прослушивания каждого диктора."""
     rows = []
     for v_id, v_label in AVAILABLE_VOICES.items():
         mark = "✅ " if v_id == current_voice else ""
@@ -1043,28 +1213,8 @@ def get_voice_and_music_kb(current_voice, bg_music=1):
     rows.append([InlineKeyboardButton(text=f"🎵 Колыбельная фоном: {bg_label}", callback_data="toggle_bg_music")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def get_reminder_inline_kb(current_time, current_tz):
-    times = ["20:00", "20:30", "21:00", "21:30", "22:00"]
-    time_btns = []
-    for t in times:
-        mark = "✅ " if t == current_time else ""
-        time_btns.append(InlineKeyboardButton(text=f"{mark}{t}", callback_data=f"remind_time_{t}"))
-
-    tz_btns = []
-    for code, (label, offset) in TIMEZONE_OFFSETS.items():
-        mark = "✅ " if offset == current_tz else ""
-        tz_btns.append([InlineKeyboardButton(text=f"🌍 Пояс: {mark}{label}", callback_data=f"remind_tz_{code}")])
-
-    rows = [
-        time_btns[:3],
-        time_btns[3:],
-        *tz_btns,
-        [InlineKeyboardButton(text="🔕 Выключить напоминание", callback_data="remind_off")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
 # ==========================================
-# 7. ОБРАБОТЧИКИ МЕНЮ, ПРОФИЛЕЙ И ПРОСЛУШИВАНИЯ ГОЛОСА
+# 7. ОБРАБОТЧИКИ КОМАНД И КНОПОК МЕНЮ
 # ==========================================
 @dp.message(F.text == "🏠 В главное меню")
 @dp.message(Command("cancel"))
@@ -1072,8 +1222,131 @@ async def cancel_to_menu(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Главное меню:", reply_markup=main_menu_keyboard)
 
+@dp.message(CommandStart())
+async def start_command_handler(message: Message, state: FSMContext, command: CommandObject = None):
+    await state.clear()
+    user_id = message.from_user.id
+    referrer_id = 0
+    utm_source = ""
+
+    if command and command.args:
+        arg_val = command.args.strip()
+        if arg_val.startswith("ref_"):
+            ref_str = arg_val.replace("ref_", "").strip()
+            if ref_str.isdigit():
+                referrer_id = int(ref_str)
+        else:
+            utm_source = sanitize_input(arg_val, max_len=40)
+
+    balance, _, _, _, _, _, _, _, _, ref_rewarded = register_or_get_user(
+        user_id, referrer_id, utm_source
+    )
+
+    if ref_rewarded and referrer_id > 0:
+        try:
+            await bot.send_message(
+                referrer_id,
+                f"🎉 По вашей ссылке присоединился друг! Вам начислено +{REFERRAL_BONUS_STORIES} бесплатные авторские сказки!"
+            )
+            await send_db_backup_to_admin(f"Новый реферал от ID {referrer_id}")
+        except Exception:
+            pass
+
+    await message.answer(
+        f"👋 Добро пожаловать в мир добрых вечерних аудиосказок!\n\n"
+        f"В боте доступны 2 режима на выбор:\n"
+        f"🪄 **Создать новую сказку** — за 15 секунд сочиняет и озвучивает уникальную историю про вашего ребёнка и его любимую игрушку.\n"
+        f"📚 **Золотая классика** — бесплатная коллекция классических сказок с ласковым обращением к малышу.\n\n"
+        f"🎙 В разделе «Голос и музыка» можно заранее прослушать дикторов.\n"
+        f"🎁 На балансе: {balance} авторские сказки (а по промокоду ДОБРО можно получить ещё +5 сказок!).",
+        reply_markup=main_menu_keyboard
+    )
+
+@dp.message(F.text == "📚 Золотая классика")
+@dp.message(Command("classics"))
+async def show_classics_menu(message: Message, state: FSMContext):
+    await state.clear()
+    load_all_classics()
+    if not CLASSICS_CATALOG:
+        admin_hint = (
+            "\n\n💡 Вы администратор: просто отправьте в этот чат файл `stories.json`, и библиотека мгновенно заработает!"
+            if is_admin(message.from_user.id) else ""
+        )
+        await message.answer(
+            f"📚 Библиотека классических сказок сейчас пополняется.\n\n"
+            f"А пока вы можете нажать «🪄 Создать новую сказку», и бот сочинит "
+            f"индивидуальную историю про вашего малыша!{admin_hint}",
+            reply_markup=main_menu_keyboard
+        )
+        return
+
+    _, _, last_child, last_hero, _, _, _, _, _ = get_user_data(message.from_user.id)
+    clean_name = extract_clean_name(last_child) if last_child else ""
+    personal_note = (
+        f"Перед началом сказки диктор ласково поприветствует малыша ({clean_name}) и его друга ({last_hero}).\n\n"
+        if (clean_name and last_hero)
+        else "💡 Совет: если добавить имя малыша в «👶 Профили детей», диктор перед сказкой обратится к нему по имени!\n\n"
+    )
+    await message.answer(
+        f"📚 Библиотека «Золотая классика» (Бесплатно)\n\n"
+        f"{personal_note}"
+        f"🎁 Классические сказки не списывают попытки с вашего баланса. Выберите сказку:",
+        reply_markup=get_classics_inline_kb(page=0)
+    )
+
+@dp.callback_query(F.data == "open_classics")
+async def open_classics_cb(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer()
+    load_all_classics()
+    if not CLASSICS_CATALOG:
+        await callback.message.answer("📚 Библиотека классических сказок сейчас пополняется.")
+        return
+    await callback.message.answer(
+        "📚 Выберите сказку из библиотеки «Золотая классика» (Бесплатно):",
+        reply_markup=get_classics_inline_kb(page=0)
+    )
+
+@dp.callback_query(F.data == "cpage_noop")
+async def classics_page_noop_cb(callback: CallbackQuery):
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("cpage_"))
+async def classics_pagination_cb(callback: CallbackQuery):
+    page_str = callback.data.replace("cpage_", "")
+    if not page_str.isdigit():
+        await callback.answer()
+        return
+    load_all_classics()
+    await callback.answer()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=get_classics_inline_kb(page=int(page_str)))
+    except Exception:
+        pass
+
+@dp.callback_query(F.data.startswith("classic_"))
+async def select_classic_story_cb(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    load_all_classics()
+    if not CLASSICS_CATALOG:
+        await callback.answer("Библиотека классики пока пуста", show_alert=True)
+        return
+
+    raw_id = callback.data.replace("classic_", "")
+    if raw_id == "random":
+        classic_id = random.choice(list(CLASSICS_CATALOG.keys()))
+    elif raw_id in CLASSICS_CATALOG:
+        classic_id = raw_id
+    else:
+        await callback.answer("Сказка не найдена", show_alert=True)
+        return
+
+    await callback.answer()
+    await enqueue_classic_story_job(callback.message, callback.from_user.id, classic_id)
+
 @dp.message(F.text == "👶 Профили детей")
-async def show_children_profiles_menu(message: Message):
+async def show_children_profiles_menu(message: Message, state: FSMContext):
+    await state.clear()
     user_id = message.from_user.id
     profiles = get_family_profiles(user_id)
     if not profiles:
@@ -1091,7 +1364,8 @@ async def show_children_profiles_menu(message: Message):
     )
 
 @dp.callback_query(F.data == "manage_children")
-async def manage_children_cb(callback: CallbackQuery):
+async def manage_children_cb(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     await callback.answer()
     await callback.message.answer(
         "👨‍👩‍👧‍👦 Выберите профиль ребёнка для следующей сказки или добавьте нового:",
@@ -1110,7 +1384,7 @@ async def select_child_profile_cb(callback: CallbackQuery):
         await callback.answer(f"Выбран профиль: {c_name}")
         await callback.message.edit_text(
             f"✅ Активный профиль: {c_name} (Любимый герой: {h_name}).\n\n"
-            f"Теперь все новые сказки и продолжения серий будут создаваться для этого малыша!",
+            f"Теперь и авторские сказки, и обращения в классических сказках будут звучать для этого малыша!",
             reply_markup=get_family_profiles_inline_kb(callback.from_user.id)
         )
     else:
@@ -1145,6 +1419,7 @@ async def add_new_child_cb(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(Command("promo"))
 async def promo_command_handler(message: Message, state: FSMContext, command: CommandObject = None):
+    await state.clear()
     if command and command.args:
         _, msg_text = activate_single_promocode_db(message.from_user.id, command.args)
         await message.answer(msg_text, reply_markup=main_menu_keyboard)
@@ -1158,15 +1433,10 @@ async def enter_promo_cb(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("🎟 Напишите ваш промокод в ответном сообщении:")
     await state.set_state(StoryCreation.waiting_for_promo)
 
-@dp.message(StoryCreation.waiting_for_promo, F.text)
-async def process_promo_input(message: Message, state: FSMContext):
-    await state.clear()
-    _, msg_text = activate_single_promocode_db(message.from_user.id, message.text)
-    await message.answer(msg_text, reply_markup=main_menu_keyboard)
-
 @dp.message(F.text.in_({"🎙 Голос и музыка", "🎨 Стиль и Голос", "🎙 Голос диктора"}))
-async def choose_voice_and_music_cmd(message: Message):
-    _, _, _, _, _, current_voice, _, _, _, _, bg_music = get_user_data(message.from_user.id)
+async def choose_voice_and_music_cmd(message: Message, state: FSMContext):
+    await state.clear()
+    _, _, _, _, _, current_voice, _, _, bg_music = get_user_data(message.from_user.id)
     bg_txt = "Включена (Музыкальная шкатулка)" if bg_music == 1 else "Выключена (Только голос)"
     await message.answer(
         f"🎙 Настройка голоса диктора и фоновой мелодии\n\n"
@@ -1181,7 +1451,7 @@ async def set_voice_callback(callback: CallbackQuery):
     voice_id = callback.data.replace("setvoice_", "")
     if voice_id in AVAILABLE_VOICES:
         set_user_voice(callback.from_user.id, voice_id)
-        _, _, _, _, _, _, _, _, _, _, bg_music = get_user_data(callback.from_user.id)
+        _, _, _, _, _, _, _, _, bg_music = get_user_data(callback.from_user.id)
         bg_txt = "Включена (Музыкальная шкатулка)" if bg_music == 1 else "Выключена (Только голос)"
         await callback.answer(f"Выбран голос: {AVAILABLE_VOICES[voice_id]}")
         await callback.message.edit_text(
@@ -1195,7 +1465,7 @@ async def set_voice_callback(callback: CallbackQuery):
 @dp.callback_query(F.data == "toggle_bg_music")
 async def toggle_bg_music_callback(callback: CallbackQuery):
     new_bg = toggle_user_bg_music(callback.from_user.id)
-    _, _, _, _, _, current_voice, _, _, _, _, _ = get_user_data(callback.from_user.id)
+    _, _, _, _, _, current_voice, _, _, _ = get_user_data(callback.from_user.id)
     status_txt = "Включена (Музыкальная шкатулка)" if new_bg == 1 else "Выключена (Только голос)"
     await callback.answer(f"Колыбельная фоном: {status_txt}")
     await callback.message.edit_text(
@@ -1214,7 +1484,7 @@ async def preview_voice_callback(callback: CallbackQuery):
         return
 
     user_id = callback.from_user.id
-    _, _, _, _, _, _, _, _, _, _, bg_music = get_user_data(user_id)
+    _, _, _, _, _, _, _, _, bg_music = get_user_data(user_id)
     voice_title = AVAILABLE_VOICES[voice_id]
     bg_note = "с музыкальной шкатулкой" if bg_music == 1 else "без фоновой музыки"
 
@@ -1256,127 +1526,66 @@ async def preview_voice_callback(callback: CallbackQuery):
             except Exception:
                 pass
 
-@dp.message(F.text == "⏰ Время спать")
-@dp.message(Command("remind"))
-async def bedtime_reminder_menu(message: Message):
-    _, _, _, _, _, _, _, remind_time, tz_offset, _, _ = get_user_data(message.from_user.id)
-    status_str = f"Включено на {remind_time} (UTC+{tz_offset})" if remind_time else "Выключено"
-    await message.answer(
-        f"⏰ Вечернее напоминание «Время спать»\n\n"
-        f"Бот мягко напомнит вам вечером, что пора приглушить свет и включить новую сказку малышу.\n\n"
-        f"Текущий статус: {status_str}\n"
-        f"Выберите ваш часовой пояс и удобное время:",
-        reply_markup=get_reminder_inline_kb(remind_time, tz_offset)
-    )
-
-@dp.callback_query(F.data.startswith("remind_time_"))
-async def set_remind_time_cb(callback: CallbackQuery):
-    chosen_time = callback.data.replace("remind_time_", "")
-    _, _, _, _, _, _, _, _, tz_offset, _, _ = get_user_data(callback.from_user.id)
-    set_user_reminder(callback.from_user.id, chosen_time)
-    await callback.answer(f"Напоминание установлено на {chosen_time}!")
-    await callback.message.edit_text(
-        f"✅ Вечернее напоминание установлено на {chosen_time} (UTC+{tz_offset})!",
-        reply_markup=get_reminder_inline_kb(chosen_time, tz_offset)
-    )
-
-@dp.callback_query(F.data.startswith("remind_tz_"))
-async def set_remind_tz_cb(callback: CallbackQuery):
-    tz_code = callback.data.replace("remind_tz_", "")
-    if tz_code in TIMEZONE_OFFSETS:
-        _, offset = TIMEZONE_OFFSETS[tz_code]
-        _, _, _, _, _, _, _, remind_time, _, _, _ = get_user_data(callback.from_user.id)
-        active_t = remind_time if remind_time else "21:00"
-        set_user_reminder(callback.from_user.id, active_t, offset)
-        await callback.answer(f"Часовой пояс UTC+{offset} сохранён!")
-        await callback.message.edit_text(
-            f"✅ Часовой пояс изменён на UTC+{offset}. Время напоминания: {active_t}",
-            reply_markup=get_reminder_inline_kb(active_t, offset)
-        )
-
-@dp.callback_query(F.data == "remind_off")
-async def set_remind_off_cb(callback: CallbackQuery):
-    _, _, _, _, _, _, _, _, tz_offset, _, _ = get_user_data(callback.from_user.id)
-    set_user_reminder(callback.from_user.id, "")
-    await callback.answer("Напоминания выключены")
-    await callback.message.edit_text(
-        "🔕 Вечерние напоминания выключены:",
-        reply_markup=get_reminder_inline_kb("", tz_offset)
-    )
-
-async def bedtime_reminder_scheduler():
-    while True:
-        try:
-            utc_now = datetime.now(timezone.utc)
-            with get_db_connection() as conn:
-                c = conn.cursor()
-                rows = c.execute(
-                    "SELECT user_id, remind_time, tz_offset, last_reminded_date, "
-                    "last_child, last_hero, tomorrow_hook FROM users WHERE remind_time != ''"
-                ).fetchall()
-
-                for uid, r_time, tz_off, last_date, l_child, l_hero, t_hook in rows:
-                    user_now = utc_now + timedelta(hours=int(tz_off or 3))
-                    today_str = user_now.strftime("%Y-%m-%d")
-                    current_hm = user_now.strftime("%H:%M")
-
-                    if current_hm == r_time and last_date != today_str:
-                        conn.execute(
-                            "UPDATE users SET last_reminded_date = ? WHERE user_id = ?",
-                            (today_str, uid)
-                        )
-                        conn.commit()
-                        clean_name = extract_clean_name(l_child) if l_child else ""
-                        child_label = f" для {clean_name}" if clean_name else ""
-                        hook_line = f"\n\n🔮 Анонс новой серии: {t_hook}" if t_hook else ""
-                        try:
-                            await bot.send_message(
-                                uid,
-                                f"🌙 Время готовиться ко сну!\n\n"
-                                f"Пора проветрить спальню, приглушить свет и включить "
-                                f"новую добрую сказку{child_label} ✨{hook_line}",
-                                reply_markup=get_post_story_inline_kb() if l_hero else main_menu_keyboard
-                            )
-                        except Exception:
-                            pass
-        except Exception as e:
-            logging.warning(f"Ошибка планировщика напоминаний: {e}")
-        await asyncio.sleep(45)
-
 @dp.message(Command("myid"))
-async def show_my_id(message: Message):
+async def show_my_id(message: Message, state: FSMContext):
+    await state.clear()
     uid = message.from_user.id
     admin_status = "✅ Вы Администратор!" if is_admin(uid) else "ℹ️ Добавьте ADMIN_ID в Render."
     await message.answer(f"🔑 Ваш Telegram ID: {uid}\n\n{admin_status}", reply_markup=main_menu_keyboard)
 
 @dp.message(Command("stats"))
-async def admin_stats_cmd(message: Message):
+async def admin_stats_cmd(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
-    u_cnt, prof_cnt, s_cnt, p_cnt, stars_sum, utm_rows = get_global_stats()
+    await state.clear()
+    load_all_classics()
+    u_cnt, prof_cnt, s_cnt, p_cnt, stars_sum, classic_cached, utm_rows = get_global_stats()
     q_size = story_task_queue.qsize() if story_task_queue else 0
     utm_text = "\n".join([f"  • {src}: {cnt} чел." for src, cnt in utm_rows]) if utm_rows else "  Пока нет переходов по меткам"
     await message.answer(
-        f"📊 Статистика бота и рекламы:\n\n"
+        f"📊 Статистика гибридного бота:\n\n"
         f"📥 Задач в очереди: {q_size}\n"
         f"👥 Семей: {u_cnt} | 👶 Детей: {prof_cnt}\n"
-        f"📚 Создано сказок: {s_cnt}\n"
+        f"📚 Всего прослушано сказок: {s_cnt}\n"
+        f"🏛 Сказок в stories.json: {len(CLASSICS_CATALOG)} (аудио в кэше: {classic_cached})\n"
         f"💳 Оплат: {p_cnt} ({stars_sum} ⭐ / ~{stars_sum * 2} ₽)\n\n"
-        f"📈 Источники трафика (UTM):\n{utm_text}"
+        f"📈 Источники трафика (UTM):\n{utm_text}\n\n"
+        f"🛠 Управление классикой:\n"
+        f"• Отправьте `.json` файл в чат — добавить/обновить сказки\n"
+        f"• Отправьте `.json` с подписью `/replace` — заменить весь каталог\n"
+        f"• `/export_stories` — скачать текущий `stories.json`"
     )
 
-@dp.message(Command("backup"))
-async def manual_backup_cmd(message: Message):
+@dp.message(Command("export_stories"))
+async def export_stories_cmd(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
+    await state.clear()
+    load_all_classics()
+    if not CLASSICS_CATALOG:
+        await message.answer("📭 Библиотека классических сказок пока пуста.")
+        return
+    export_classics_to_json_file()
+    if os.path.exists(STORIES_JSON_PATH):
+        await message.answer_document(
+            document=FSInputFile(STORIES_JSON_PATH, filename="stories.json"),
+            caption=f"📚 Текущая база классических сказок ({len(CLASSICS_CATALOG)} шт.)"
+        )
+
+@dp.message(Command("backup"))
+async def manual_backup_cmd(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
     await send_db_backup_to_admin("Ручной запрос /backup")
 
 @dp.message(F.document, F.caption == "/restore")
-async def restore_db_from_file(message: Message):
+async def restore_db_from_file(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
+    await state.clear()
     doc = message.document
-    if not doc.file_name.endswith(".db"):
+    if not doc.file_name or not doc.file_name.endswith(".db"):
         await message.answer("⚠️ Отправьте файл с расширением .db")
         return
     temp_restore = f"{DB_PATH}.restore"
@@ -1384,25 +1593,71 @@ async def restore_db_from_file(message: Message):
         await bot.download(doc, destination=temp_restore)
         shutil.move(temp_restore, DB_PATH)
         init_db()
-        await message.answer("✅ База данных успешно восстановлена!")
+        load_all_classics(force=True)
+        await message.answer(
+            f"✅ База данных успешно восстановлена! В каталоге классики: {len(CLASSICS_CATALOG)} шт."
+        )
     except Exception as e:
         await message.answer(f"⚠️ Ошибка восстановления БД: {e}")
 
+@dp.message(F.document)
+async def upload_stories_json_from_telegram(message: Message, state: FSMContext):
+    """Позволяет администратору добавлять или заменять сказки в stories.json прямо через чат с ботом."""
+    if not is_admin(message.from_user.id):
+        return
+    doc = message.document
+    if not doc.file_name or not doc.file_name.lower().endswith(".json"):
+        return
+
+    await state.clear()
+    replace_mode = bool(message.caption and "/replace" in message.caption.lower())
+    temp_json = f"{STORIES_JSON_PATH}.tmp"
+
+    try:
+        await bot.download(doc, destination=temp_json)
+        with open(temp_json, "r", encoding="utf-8-sig") as f:
+            parsed = json.load(f)
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+            if not isinstance(parsed, list):
+                raise ValueError("JSON должен быть списком объектов [...] или объектом сказки {...}")
+
+        added_cnt, total_cnt = import_stories_from_list(parsed, replace_all=replace_mode)
+        mode_str = "Каталог полностью заменён" if replace_mode else "Сказки добавлены/обновлены"
+        await message.answer(
+            f"✅ {mode_str} из файла `{doc.file_name}`!\n"
+            f"📥 Обработано записей: {added_cnt} шт.\n"
+            f"📚 Всего классических сказок в меню: {total_cnt} шт.\n"
+            f"💾 Изменения синхронизированы с `stories.json` и базой данных."
+        )
+        await send_db_backup_to_admin(f"Обновление stories.json ({total_cnt} ск.)")
+    except Exception as e:
+        await message.answer(f"⚠️ Ошибка загрузки JSON: {e}")
+    finally:
+        if os.path.exists(temp_json):
+            try:
+                os.remove(temp_json)
+            except Exception:
+                pass
+
 @dp.message(Command("terms"))
-async def terms_cmd(message: Message):
+async def terms_cmd(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer(
         "📜 Пользовательское соглашение:\n"
-        "1. Бот генерирует персональные аудиосказки на ночь с помощью ИИ.\n"
+        "1. Бот предоставляет бесплатный доступ к библиотеке классических сказок и генерирует индивидуальные авторские аудиосказки с помощью ИИ.\n"
         "2. Оплата пакетов и подписки производится через официальные Telegram Stars (XTR).\n"
         "3. Поддержка пользователей: /paysupport."
     )
 
 @dp.message(Command("paysupport"))
-async def paysupport_cmd(message: Message):
+async def paysupport_cmd(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer("🛎 Напишите ваш вопрос с пометкой #оплата — он будет сразу передан администратору.")
 
 @dp.message(F.text.contains("#оплата"))
-async def forward_support_to_admin(message: Message):
+async def forward_support_to_admin(message: Message, state: FSMContext):
+    await state.clear()
     if ADMIN_ID != 0:
         try:
             await bot.send_message(
@@ -1411,20 +1666,21 @@ async def forward_support_to_admin(message: Message):
             )
         except Exception:
             pass
-    await message.answer("✅ Ваше сообщение передано администратору!")
+    await message.answer("✅ Ваше сообщение передано администратору!", reply_markup=main_menu_keyboard)
 
 @dp.message(F.text.in_({"👤 Мой профиль", "👤 Мой баланс"}))
-async def show_balance(message: Message):
+async def show_balance(message: Message, state: FSMContext):
+    await state.clear()
     user_id = message.from_user.id
-    balance, total, last_child, last_hero, _, voice, refs_cnt, remind_time, tz_off, _, bg_music = get_user_data(user_id)
+    balance, total, last_child, last_hero, _, voice, refs_cnt, tomorrow_hook, bg_music = get_user_data(user_id)
     has_sub, sub_days = get_subscription_status(user_id)
     profiles = get_family_profiles(user_id)
     voice_name = AVAILABLE_VOICES.get(voice, AVAILABLE_VOICES[DEFAULT_VOICE])
 
     if has_sub:
-        status_line = f"👑 Безлимитная подписка: активна (ещё {sub_days} дн.)\n🎧 Запасных сказок: {balance} шт."
+        status_line = f"👑 Безлимитная подписка: активна (ещё {sub_days} дн.)\n🎧 Запасных авторских сказок: {balance} шт."
     else:
-        status_line = f"🎧 Доступно сказок: {balance} шт."
+        status_line = f"🎧 Доступно авторских сказок: {balance} шт.\n📚 Золотая классика: безлимитно и бесплатно"
 
     if profiles:
         children_lines = "\n".join(
@@ -1434,7 +1690,6 @@ async def show_balance(message: Message):
     else:
         family_block = f"\n🧸 Активный герой: {last_hero} (для: {last_child})" if last_hero else ""
 
-    remind_info = f"\n⏰ Напоминание ко сну: {remind_time} (UTC+{tz_off})" if remind_time else "\n⏰ Напоминание: выкл."
     bg_info = "Вкл (Музыкальная шкатулка)" if bg_music == 1 else "Выкл"
     bot_info = await bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
@@ -1450,11 +1705,11 @@ async def show_balance(message: Message):
     await message.answer(
         f"👤 Семейный профиль:\n\n"
         f"{status_line}\n"
-        f"📚 Всего прослушано сказок: {total} шт.{family_block}\n\n"
+        f"📊 Всего прослушано сказок: {total} шт.{family_block}\n\n"
         f"🎙 Голос диктора: {voice_name}\n"
-        f"🎵 Колыбельная фоном: {bg_info}{remind_info}\n"
+        f"🎵 Колыбельная фоном: {bg_info}\n"
         f"👥 Приглашено друзей: {refs_cnt}\n\n"
-        f"🎁 Ваша ссылка (+{REFERRAL_BONUS_STORIES} сказки за друга):\n{ref_link}",
+        f"🎁 Ваша ссылка (+{REFERRAL_BONUS_STORIES} авторские сказки за друга):\n{ref_link}",
         reply_markup=profile_kb
     )
 
@@ -1467,30 +1722,33 @@ async def ref_program_callback(callback: CallbackQuery):
     await callback.message.answer(
         f"🎁 Дарим бесплатные сказки за друзей!\n\n"
         f"Перешлите эту ссылку знакомым родителям:\n{ref_link}\n\n"
-        f"За каждого друга вам автоматически начислится +{REFERRAL_BONUS_STORIES} бесплатные сказки!",
+        f"За каждого друга вам автоматически начислится +{REFERRAL_BONUS_STORIES} бесплатные авторские сказки!",
         reply_markup=main_menu_keyboard
     )
 
 @dp.message(F.text.in_({"💎 Тарифы и Подписка", "💎 Купить сказки (\u2b50 Звёзды)"}))
-async def show_tariffs(message: Message):
+async def show_tariffs(message: Message, state: FSMContext):
+    await state.clear()
     user_id = message.from_user.id
-    balance, _, _, _, _, _, _, _, _, tomorrow_hook, _ = get_user_data(user_id)
+    balance, _, _, _, _, _, _, tomorrow_hook, _ = get_user_data(user_id)
     has_sub, sub_days = get_subscription_status(user_id)
     sub_str = f"👑 Активна безлимитная подписка (ещё {sub_days} дн.)\n" if has_sub else ""
     hook_block = f"\n🔮 В следующей серии:\n«{tomorrow_hook}»\n" if tomorrow_hook else ""
 
     await message.answer(
         f"💎 Тарифы и Месячная подписка\n\n"
-        f"{sub_str}🎧 Доступно сказок на балансе: {balance} шт.{hook_block}\n"
-        f"• 5 сказок — 99 ₽ (50 ⭐)\n"
-        f"• 15 сказок — 199 ₽ (100 ⭐)\n"
+        f"{sub_str}🎧 Доступно авторских сказок: {balance} шт.\n"
+        f"📚 Раздел «Золотая классика» всегда доступен бесплатно!{hook_block}\n"
+        f"• 5 авторских сказок — 99 ₽ (50 ⭐)\n"
+        f"• 15 авторских сказок — 199 ₽ (100 ⭐)\n"
         f"• Подписка на месяц (30 дней безлимита) — 499 ₽ (250 ⭐)\n\n"
-        f"Каждая сказка включает индивидуальный сюжет про вашего малыша, вопросы на обсуждение и мягкую озвучку под музыкальную шкатулку:",
+        f"Каждая авторская сказка сочиняется индивидуально про вашего малыша и его любимую игрушку:",
         reply_markup=get_tariffs_inline_kb()
     )
 
 @dp.message(Command("add_free"))
-async def add_free_cmd(message: Message):
+async def add_free_cmd(message: Message, state: FSMContext):
+    await state.clear()
     user_id = message.from_user.id
     if not is_admin(user_id):
         await message.answer("🎁 Используйте промокод ДОБРО или пригласите друга в разделе «👤 Мой профиль»!")
@@ -1508,9 +1766,9 @@ async def send_stars_invoice(callback: CallbackQuery):
     t = TARIFFS[pack_key]
     await callback.answer()
     desc = (
-        "Безлимитный доступ к созданию персональных аудиосказок на ночь на 30 дней."
+        "Безлимитный доступ к созданию персональных авторских аудиосказок на ночь на 30 дней."
         if t["days"] > 0
-        else f"Пакет на {t['stories']} персональных аудиосказок с колыбельной шкатулкой."
+        else f"Пакет на {t['stories']} персональных авторских аудиосказок с колыбельной шкатулкой."
     )
     await bot.send_invoice(
         chat_id=callback.from_user.id,
@@ -1554,62 +1812,21 @@ async def process_successful_payment(message: Message):
     else:
         await message.answer(
             f"🎉 Оплата прошла успешно!\n"
-            f"Начислено: +{t['stories']} сказок. Всего доступно на балансе: {new_balance} шт.",
+            f"Начислено: +{t['stories']} авторских сказок. Всего доступно на балансе: {new_balance} шт.",
             reply_markup=main_menu_keyboard
         )
 
-# ==========================================
-# 8. ДИАЛОГИ ВЫБОРА И ПОСТАНОВКА В ОЧЕРЕДЬ
-# ==========================================
-@dp.message(CommandStart())
-async def start_command_handler(message: Message, state: FSMContext, command: CommandObject = None):
-    await state.clear()
-    user_id = message.from_user.id
-    referrer_id = 0
-    utm_source = ""
-
-    if command and command.args:
-        arg_val = command.args.strip()
-        if arg_val.startswith("ref_"):
-            ref_str = arg_val.replace("ref_", "").strip()
-            if ref_str.isdigit():
-                referrer_id = int(ref_str)
-        else:
-            utm_source = sanitize_input(arg_val, max_len=40)
-
-    balance, _, _, _, _, _, _, _, _, _, _, ref_rewarded = register_or_get_user(
-        user_id, referrer_id, utm_source
-    )
-
-    if ref_rewarded and referrer_id > 0:
-        try:
-            await bot.send_message(
-                referrer_id,
-                f"🎉 По вашей ссылке присоединился друг! Вам начислено +{REFERRAL_BONUS_STORIES} бесплатные сказки!"
-            )
-            await send_db_backup_to_admin(f"Новый реферал от ID {referrer_id}")
-        except Exception:
-            pass
-
-    await message.answer(
-        f"👋 Добро пожаловать в мир добрых персональных аудиосказок!\n\n"
-        f"✨ Бот сочиняет уютную сказку на ночь про вашего ребёнка и его любимую игрушку "
-        f"и озвучивает её живым ласковым голосом под мелодию музыкальной шкатулки.\n\n"
-        f"🎙 В меню «Голос и музыка» можно заранее прослушать и выбрать голос диктора.\n"
-        f"🎁 На вашем балансе: {balance} бесплатные сказки (а по промокоду ДОБРО можно получить ещё +5 сказок!).",
-        reply_markup=main_menu_keyboard
-    )
-
-@dp.message(F.text == "🪄 Создать новую сказку")
+@dp.message(F.text.in_({"🪄 Авторская сказка (ИИ)", "🪄 Создать новую сказку"}))
 async def create_new_story_btn(message: Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
-    _, _, _, _, _, _, _, _, _, tomorrow_hook, _ = get_user_data(user_id)
+    _, _, _, _, _, _, _, tomorrow_hook, _ = get_user_data(user_id)
 
     if not has_available_stories(user_id):
         hook_msg = f"\n\n🔮 В следующей серии: «{tomorrow_hook}»" if tomorrow_hook else ""
         await message.answer(
-            f"🌙 Бесплатные сказки закончились!{hook_msg}\nВыберите удобный пакет или активируйте промокод ДОБРО:",
+            f"🌙 Бесплатные авторские сказки закончились!{hook_msg}\n"
+            f"Вы можете бесплатно слушать «📚 Золотую классику» в меню, ввести промокод ДОБРО или выбрать удобный тариф:",
             reply_markup=get_tariffs_inline_kb()
         )
         return
@@ -1634,14 +1851,17 @@ async def create_new_story_btn(message: Message, state: FSMContext):
         )
     await state.set_state(StoryCreation.waiting_for_child_info)
 
-@dp.message(F.text == "🧸 Сказкотерапия (страхи/сон)")
+@dp.message(F.text.in_({"🧸 Сказкотерапия", "🧸 Сказкотерапия (страхи/сон)"}))
 async def start_therapy_mode(message: Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
-    _, _, last_child, last_hero, _, _, _, _, _, _, _ = get_user_data(user_id)
+    _, _, last_child, last_hero, _, _, _, _, _ = get_user_data(user_id)
 
     if not has_available_stories(user_id):
-        await message.answer("🌙 Сказки на балансе закончились! Пополните баланс:", reply_markup=get_tariffs_inline_kb())
+        await message.answer(
+            "🌙 Авторские сказки на балансе закончились! Пополните баланс или послушайте бесплатную «📚 Золотую классику»:",
+            reply_markup=get_tariffs_inline_kb()
+        )
         return
 
     if last_child and last_hero:
@@ -1676,12 +1896,12 @@ async def same_hero_cb(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
     user_id = callback.from_user.id
-    _, _, last_child, last_hero, _, _, _, _, _, _, _ = get_user_data(user_id)
+    _, _, last_child, last_hero, _, _, _, _, _ = get_user_data(user_id)
     if not has_available_stories(user_id):
-        await callback.message.answer("🌙 Сказки закончились! Выберите пакет ниже:", reply_markup=get_tariffs_inline_kb())
+        await callback.message.answer("🌙 Авторские сказки закончились! Выберите пакет ниже:", reply_markup=get_tariffs_inline_kb())
         return
     if not last_child or not last_hero:
-        await callback.message.answer("Нажмите «🪄 Создать новую сказку», чтобы задать имя и героя.")
+        await callback.message.answer("Нажмите «🪄 Создать новую сказку», чтобы задать имя ребёнка и любимую игрушку.")
         return
 
     await state.update_data(child_info=last_child, hero=last_hero, is_continuation=False)
@@ -1692,10 +1912,10 @@ async def same_hero_cb(callback: CallbackQuery, state: FSMContext):
     await state.set_state(StoryCreation.waiting_for_theme)
 
 async def enqueue_continuation(message: Message, user_id):
-    _, _, last_child, last_hero, last_summary, _, _, _, _, tomorrow_hook, _ = get_user_data(user_id)
+    _, _, last_child, last_hero, last_summary, _, _, tomorrow_hook, _ = get_user_data(user_id)
     if not has_available_stories(user_id):
         hook_msg = f"\n\n🔮 В этой серии: «{tomorrow_hook}»" if tomorrow_hook else ""
-        await message.answer(f"🌙 Сказки закончились!{hook_msg}\nПополните баланс:", reply_markup=get_tariffs_inline_kb())
+        await message.answer(f"🌙 Авторские сказки закончились!{hook_msg}\nПополните баланс:", reply_markup=get_tariffs_inline_kb())
         return
     if not last_summary or not last_hero:
         await message.answer(
@@ -1705,7 +1925,7 @@ async def enqueue_continuation(message: Message, user_id):
         return
 
     next_theme = tomorrow_hook if tomorrow_hook else "Новое доброе вечернее приключение и сладкий сон"
-    await enqueue_story_job(
+    await enqueue_ai_story_job(
         message=message,
         user_id=user_id,
         child=last_child or "Малыш",
@@ -1715,9 +1935,27 @@ async def enqueue_continuation(message: Message, user_id):
         prev_summary=last_summary
     )
 
+# ==========================================
+# 8. ОБРАБОТЧИКИ СОСТОЯНИЙ FSM (СТРОГО ПОСЛЕ МЕНЮ)
+# ==========================================
+@dp.message(StoryCreation.waiting_for_promo, F.text)
+async def process_promo_input(message: Message, state: FSMContext):
+    if message.text.strip().startswith("/"):
+        await state.clear()
+        await message.answer("Главное меню:", reply_markup=main_menu_keyboard)
+        return
+    await state.clear()
+    _, msg_text = activate_single_promocode_db(message.from_user.id, message.text)
+    await message.answer(msg_text, reply_markup=main_menu_keyboard)
+
 @dp.message(StoryCreation.waiting_for_child_info, F.text)
 async def process_child_info(message: Message, state: FSMContext):
     text = message.text.strip()
+    if text.startswith("/"):
+        await state.clear()
+        await message.answer("Диалог отменён. Главное меню:", reply_markup=main_menu_keyboard)
+        return
+
     if text == "➕ Добавить другого ребёнка":
         await message.answer(
             "👶 Напишите имя и возраст ребёнка:\n(Например: Артём, 5 лет)",
@@ -1754,6 +1992,11 @@ async def process_child_info(message: Message, state: FSMContext):
 
 @dp.message(StoryCreation.waiting_for_hero, F.text)
 async def process_hero(message: Message, state: FSMContext):
+    if message.text.strip().startswith("/"):
+        await state.clear()
+        await message.answer("Диалог отменён. Главное меню:", reply_markup=main_menu_keyboard)
+        return
+
     clean_hero = sanitize_input(message.text, max_len=60)
     if len(clean_hero) < 2:
         await message.answer("Пожалуйста, напишите имя любимого героя или игрушки:")
@@ -1779,6 +2022,11 @@ async def process_hero(message: Message, state: FSMContext):
 @dp.message(StoryCreation.waiting_for_theme, F.text)
 async def process_theme_choice(message: Message, state: FSMContext):
     theme_text = message.text.strip()
+    if theme_text.startswith("/"):
+        await state.clear()
+        await message.answer("Диалог отменён. Главное меню:", reply_markup=main_menu_keyboard)
+        return
+
     if theme_text == "✍️ Своя тема":
         await message.answer("✍️ Напишите кратко, о чём должна быть сказка (до 140 символов):")
         await state.set_state(StoryCreation.waiting_for_custom_theme)
@@ -1787,7 +2035,7 @@ async def process_theme_choice(message: Message, state: FSMContext):
     clean_theme = sanitize_input(theme_text, max_len=140)
     data = await state.get_data()
     await state.clear()
-    await enqueue_story_job(
+    await enqueue_ai_story_job(
         message=message,
         user_id=message.from_user.id,
         child=data.get("child_info", "Малыш"),
@@ -1799,6 +2047,11 @@ async def process_theme_choice(message: Message, state: FSMContext):
 
 @dp.message(StoryCreation.waiting_for_custom_theme, F.text)
 async def process_custom_theme(message: Message, state: FSMContext):
+    if message.text.strip().startswith("/"):
+        await state.clear()
+        await message.answer("Диалог отменён. Главное меню:", reply_markup=main_menu_keyboard)
+        return
+
     clean_theme = sanitize_input(message.text, max_len=140)
     if len(clean_theme) < 3:
         await message.answer("Пожалуйста, опишите тему чуть подробнее:")
@@ -1806,7 +2059,7 @@ async def process_custom_theme(message: Message, state: FSMContext):
 
     data = await state.get_data()
     await state.clear()
-    await enqueue_story_job(
+    await enqueue_ai_story_job(
         message=message,
         user_id=message.from_user.id,
         child=data.get("child_info", "Малыш"),
@@ -1817,10 +2070,77 @@ async def process_custom_theme(message: Message, state: FSMContext):
     )
 
 # ==========================================
-# 9. ГЕНЕРАЦИЯ ТЕКСТА СКАЗКИ (GEMINI API)
+# 9. ГЕНЕРАЦИЯ И СБОРКА СКАЗОК (БЕЗ ВОПРОСОВ)
 # ==========================================
+def build_classic_story_bundle(classic_id, child_raw, hero_raw):
+    item = CLASSICS_CATALOG.get(classic_id)
+    if not item:
+        raise RuntimeError("Выбранная сказка не найдена в stories.json")
+
+    title = item["title"]
+    body_text = item["text"]
+    text_hash = item.get("text_hash", "")
+
+    clean_name = extract_clean_name(child_raw) if child_raw else ""
+    clean_hero = hero_raw.strip() if hero_raw else ""
+
+    if clean_name and clean_hero:
+        prologue = (
+            f"Добрый вечер, {clean_name}. Твой верный друг, {clean_hero}, уже уютно устроился "
+            f"рядом на мягкой подушечке. Давай укроемся тёплым одеяльцем и вместе послушаем добрую сказку."
+        )
+        epilogue = f"Спокойной ночи, {clean_name}. Самых сладких и тёплых тебе снов."
+    elif clean_name:
+        prologue = (
+            f"Добрый вечер, {clean_name}. Устраивайся поудобнее на мягкой подушечке и укрывайся "
+            f"тёплым одеяльцем. Сейчас мы послушаем добрую вечернюю сказку."
+        )
+        epilogue = f"Спокойной ночи, {clean_name}. Самых сладких и тёплых тебе снов."
+    else:
+        prologue = (
+            "Добрый вечер, мой хороший. Устраивайся поудобнее на мягкой подушечке "
+            "и укрывайся тёплым одеяльцем. Сейчас мы послушаем добрую вечернюю сказку."
+        )
+        epilogue = "Спокойной ночи, малыш. Самых сладких и добрых тебе снов."
+
+    full_tts_text = f"{prologue}\n\n{body_text}\n\n{epilogue}"
+    display_text = f"{title}\n\n{prologue}\n\n{body_text}\n\n{epilogue}"
+    return title, display_text, full_tts_text, clean_name, clean_hero, text_hash
+
+async def send_long_story_text(status_msg: Message, fallback_msg: Message, full_text: str):
+    """Безопасно отправляет текст сказки любой длины без обрезки концовки."""
+    if len(full_text) <= 4000:
+        try:
+            await status_msg.edit_text(full_text)
+        except Exception:
+            await fallback_msg.answer(full_text)
+        return
+
+    chunks = []
+    current = ""
+    for para in full_text.split("\n\n"):
+        if len(current) + len(para) + 2 <= 3900:
+            current = f"{current}\n\n{para}" if current else para
+        else:
+            if current:
+                chunks.append(current)
+            current = para[:3900]
+    if current:
+        chunks.append(current)
+
+    for idx, ch in enumerate(chunks):
+        if idx == 0:
+            try:
+                await status_msg.edit_text(ch)
+            except Exception:
+                await fallback_msg.answer(ch)
+        else:
+            await fallback_msg.answer(ch)
+
 def strip_service_tags_and_clean(raw_text, default_hero, default_theme):
     text = raw_text.replace("\u0301", "").replace("́", "").strip()
+    text = re.sub(r'[*#_~`>|]', '', text)
+
     summary = f"Добрая история про героя ({default_hero}) на тему: {default_theme}."
     tomorrow_hook = f"Новое волшебное приключение, которое {default_hero} покажет малышу завтра вечером."
 
@@ -1834,17 +2154,14 @@ def strip_service_tags_and_clean(raw_text, default_hero, default_theme):
         summary = sum_match.group(1).strip()
         text = re.sub(r'SUMMARY\s*:\s*.+', '', text, flags=re.IGNORECASE).strip()
 
-    cleaned = re.sub(r'[*#_~`>|]', '', text)
-    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
-
-    story_only = cleaned
-    for marker in ["💬 Вопросы", "Вопросы для малыша", "ВОПРОСЫ ДЛЯ ОБСУЖДЕНИЯ", "ПЕРЕД СНОМ"]:
-        if marker.lower() in cleaned.lower():
-            idx = cleaned.lower().find(marker.lower())
-            story_only = cleaned[:idx].strip()
+    for marker in ["💬 Вопросы", "Вопросы для малыша", "ВОПРОСЫ ДЛЯ ОБСУЖДЕНИЯ"]:
+        if marker.lower() in text.lower():
+            idx = text.lower().find(marker.lower())
+            text = text[:idx].strip()
             break
 
-    return cleaned, story_only, summary[:250], tomorrow_hook[:200]
+    story_clean = re.sub(r'\n{3,}', '\n\n', text).strip()
+    return story_clean, summary[:250], tomorrow_hook[:200]
 
 async def fetch_available_models(session, api_key):
     if api_key in cached_models_by_key:
@@ -1882,7 +2199,7 @@ async def fetch_available_models(session, api_key):
 
     return ["models/gemini-2.0-flash", "models/gemini-1.5-flash", "models/gemini-2.5-flash"]
 
-async def generate_story_bundle(child, hero, theme, is_continuation, prev_summary):
+async def generate_ai_story_bundle(child, hero, theme, is_continuation, prev_summary):
     global current_key_index
 
     keys = get_all_gemini_keys()
@@ -1903,7 +2220,7 @@ async def generate_story_bundle(child, hero, theme, is_continuation, prev_summar
         "не используй «село» и «дорога». "
         "4. Естественно склоняй имя ребёнка по падежам русского языка и никогда не вставляй цифру возраста в сам текст сказки. "
         "5. Пиши плавными, мелодичными предложениями без скобок, кавычек и сложных причастных оборотов. "
-        "Не используй дыхательную гимнастику — завершай сказку спокойной картиной уютного засыпания."
+        "Не пиши никаких вопросов в конце сказки — завершай историю спокойной картиной уютного засыпания."
     )
 
     if is_continuation:
@@ -1923,9 +2240,8 @@ async def generate_story_bundle(child, hero, theme, is_continuation, prev_summar
         f"Строгий формат ответа:\n"
         f"1. Сказка объёмом 300-360 слов, разделённая на 5 абзацев. Первые 4 абзаца раскрывают доброе неспешное приключение, "
         f"а в 5-м абзаце наступает тихий вечер: за окном светят звёздочки, {hero} и {clean_name} уютно укрываются тёплым одеяльцем и сладко засыпают.\n"
-        f"2. С новой строки заголовок '💬 Вопросы для малыша перед сном:' и 2 коротких ласковых вопроса по сюжету.\n"
-        f"3. С новой строки 'SUMMARY: ' и 1 предложение о том, что произошло в сказке.\n"
-        f"4. С новой строки 'TOMORROW_HOOK: ' и 1 интригующее предложение-анонс завтрашней серии.\n"
+        f"2. С новой строки 'SUMMARY: ' и 1 предложение о том, что произошло в сказке.\n"
+        f"3. С новой строки 'TOMORROW_HOOK: ' и 1 интригующее предложение-анонс завтрашней серии.\n"
         f"Пиши без символов звёздочек (*) и решёток (#)."
     )
 
@@ -1963,12 +2279,12 @@ async def generate_story_bundle(child, hero, theme, is_continuation, prev_summar
                         return "".join(p.get("text", "") for p in parts)
 
                 full_raw = await retry_with_backoff(_do_request, retries=2, base_delay=0.6, max_delay=2.5)
-                display_text, story_for_tts, summary, tomorrow_hook = strip_service_tags_and_clean(full_raw, hero, theme)
-                word_count = len(story_for_tts.split())
+                story_clean, summary, tomorrow_hook = strip_service_tags_and_clean(full_raw, hero, theme)
+                word_count = len(story_clean.split())
 
                 if word_count >= 100:
                     current_key_index = key_idx
-                    return display_text, story_for_tts, summary, tomorrow_hook
+                    return story_clean, summary, tomorrow_hook
                 else:
                     last_error = f"Короткий ответ ({word_count} слов)"
             except Exception as e:
@@ -1978,9 +2294,9 @@ async def generate_story_bundle(child, hero, theme, is_continuation, prev_summar
     raise RuntimeError(f"Серверы нейросети временно перегружены ({last_error}). Попробуйте через минуту.")
 
 # ==========================================
-# 10. ФОНОВАЯ ОЧЕРЕДЬ ЗАДАЧ И ВОРКЕРЫ
+# 10. ЕДИНАЯ ОЧЕРЕДЬ ЗАДАЧ (БЕЗ DEADLOCK-ОВ)
 # ==========================================
-async def enqueue_story_job(message, user_id, child, hero, theme_text, is_continuation, prev_summary):
+async def enqueue_ai_story_job(message, user_id, child, hero, theme_text, is_continuation, prev_summary):
     if user_id in active_generations:
         await message.answer("⏳ Ваша сказка уже создаётся, подождите несколько секунд...")
         return
@@ -1991,60 +2307,149 @@ async def enqueue_story_job(message, user_id, child, hero, theme_text, is_contin
         return
 
     if not has_available_stories(user_id):
-        await message.answer("🌙 Сказки на балансе закончились! Выберите удобный тариф:", reply_markup=get_tariffs_inline_kb())
+        await message.answer("🌙 Авторские сказки закончились! Выберите удобный тариф:", reply_markup=get_tariffs_inline_kb())
         return
 
     active_generations.add(user_id)
-    clean_name = extract_clean_name(child)
-    q_waiting = story_task_queue.qsize() if story_task_queue else 0
-    queue_note = f" (Номер в очереди: {q_waiting + 1})" if q_waiting >= NUM_QUEUE_WORKERS else ""
+    try:
+        clean_name = extract_clean_name(child)
+        q_waiting = story_task_queue.qsize() if story_task_queue else 0
+        queue_note = f" (Номер в очереди: {q_waiting + 1})" if q_waiting >= NUM_QUEUE_WORKERS else ""
 
-    status_msg = await message.answer(
-        f"✍️ Сочиняю добрую сказку на ночь для: {clean_name} (герой: {hero})...{queue_note}",
-        reply_markup=ReplyKeyboardRemove()
-    )
+        status_msg = await message.answer(
+            f"✍️ Сочиняю авторскую сказку на ночь для: {clean_name} (герой: {hero})...{queue_note}",
+            reply_markup=ReplyKeyboardRemove()
+        )
 
-    job = {
-        "message": message,
-        "status_msg": status_msg,
-        "user_id": user_id,
-        "child": child,
-        "hero": hero,
-        "theme_text": theme_text,
-        "is_continuation": is_continuation,
-        "prev_summary": prev_summary
-    }
-    await story_task_queue.put(job)
+        job = {
+            "job_type": "ai",
+            "message": message,
+            "status_msg": status_msg,
+            "user_id": user_id,
+            "child": child,
+            "hero": hero,
+            "theme_text": theme_text,
+            "is_continuation": is_continuation,
+            "prev_summary": prev_summary
+        }
+        await story_task_queue.put(job)
+    except Exception:
+        active_generations.discard(user_id)
+        raise
+
+async def enqueue_classic_story_job(message, user_id, classic_id):
+    if user_id in active_generations:
+        await message.answer("⏳ Ваша сказка уже озвучивается, подождите несколько секунд...")
+        return
+
+    wait_sec = check_rate_limit(user_id)
+    if wait_sec > 0:
+        await message.answer(f"⏳ Пожалуйста, подождите {wait_sec} сек. перед следующим запросом.")
+        return
+
+    item = CLASSICS_CATALOG.get(classic_id)
+    if not item:
+        await message.answer("⚠️ Выбранная сказка не найдена в библиотеке.")
+        return
+
+    active_generations.add(user_id)
+    try:
+        q_waiting = story_task_queue.qsize() if story_task_queue else 0
+        queue_note = f" (Номер в очереди: {q_waiting + 1})" if q_waiting >= NUM_QUEUE_WORKERS else ""
+
+        status_msg = await message.answer(
+            f"📚 Открываю книгу «{item['title']}» и готовлю озвучку...{queue_note}"
+        )
+
+        job = {
+            "job_type": "classic",
+            "classic_id": classic_id,
+            "message": message,
+            "status_msg": status_msg,
+            "user_id": user_id
+        }
+        await story_task_queue.put(job)
+    except Exception:
+        active_generations.discard(user_id)
+        raise
 
 async def process_single_story_job(job):
     user_id = job["user_id"]
     msg = job["message"]
     status_msg = job["status_msg"]
-    child = job["child"]
-    hero = job["hero"]
-    theme_text = job["theme_text"]
-    is_continuation = job["is_continuation"]
-    prev_summary = job["prev_summary"]
+    job_type = job.get("job_type", "ai")
 
-    clean_name = extract_clean_name(child)
     unique_tag = f"{user_id}_{int(time.time() * 1000)}"
     audio_path = f"/tmp/story_{unique_tag}.ogg" if os.path.exists("/tmp") else f"story_{unique_tag}.ogg"
 
     try:
-        _, _, _, _, _, preferred_voice, _, _, _, _, bg_music = get_user_data(user_id)
+        _, _, last_child, last_hero, _, preferred_voice, _, _, bg_music = get_user_data(user_id)
+        voice_label = AVAILABLE_VOICES.get(preferred_voice, AVAILABLE_VOICES[DEFAULT_VOICE])
+
+        if job_type == "classic":
+            classic_id = job["classic_id"]
+            title, display_text, full_tts_text, clean_name, clean_hero, text_hash = build_classic_story_bundle(
+                classic_id, last_child, last_hero
+            )
+
+            await send_long_story_text(status_msg, msg, display_text)
+
+            cached_fid = get_cached_classic_audio(
+                classic_id, text_hash, clean_name, clean_hero, preferred_voice, bg_music
+            )
+            caption_txt = (
+                f"🎧 {title}\n"
+                f"🎙 Диктор: {voice_label}\n"
+                f"🎁 Золотая классика (бесплатно)"
+            )
+
+            sent_from_cache = False
+            if cached_fid:
+                try:
+                    await msg.answer_voice(
+                        voice=cached_fid,
+                        caption=caption_txt,
+                        reply_markup=get_post_story_inline_kb(is_classic=True)
+                    )
+                    sent_from_cache = True
+                except Exception:
+                    cached_fid = ""
+
+            if not sent_from_cache:
+                async with ChatActionSender.record_voice(bot=bot, chat_id=msg.chat.id):
+                    await synthesize_speech_to_file(full_tts_text, audio_path, preferred_voice, bg_music)
+                sent_v = await msg.answer_voice(
+                    voice=FSInputFile(audio_path),
+                    caption=caption_txt,
+                    reply_markup=get_post_story_inline_kb(is_classic=True)
+                )
+                if sent_v.voice:
+                    save_cached_classic_audio(
+                        classic_id, text_hash, clean_name, clean_hero, preferred_voice, bg_music, sent_v.voice.file_id
+                    )
+
+            increment_classic_counter(user_id)
+            await msg.answer("Главное меню:", reply_markup=main_menu_keyboard)
+            return
+
+        child = job["child"]
+        hero = job["hero"]
+        theme_text = job["theme_text"]
+        is_continuation = job["is_continuation"]
+        prev_summary = job["prev_summary"]
+        clean_name = extract_clean_name(child)
 
         async with ChatActionSender.typing(bot=bot, chat_id=msg.chat.id):
-            display_text, story_for_tts, new_summary, tomorrow_hook = await generate_story_bundle(
+            story_clean, new_summary, tomorrow_hook = await generate_ai_story_bundle(
                 child, hero, theme_text, is_continuation, prev_summary
             )
 
-        try:
-            await status_msg.edit_text(f"📖 Сказка для: {clean_name}\n\n{display_text[:4000]}")
-        except Exception:
-            await msg.answer(f"📖 Сказка для: {clean_name}\n\n{display_text[:4000]}")
+        await send_long_story_text(
+            status_msg, msg, f"📖 Авторская сказка для: {clean_name}\n\n{story_clean}"
+        )
 
         async with ChatActionSender.record_voice(bot=bot, chat_id=msg.chat.id):
-            await synthesize_speech_to_file(story_for_tts, audio_path, preferred_voice, bg_music)
+            await synthesize_speech_to_file(story_clean, audio_path, preferred_voice, bg_music)
 
         remaining, total_gen = update_user_after_story(user_id, child, hero, new_summary, tomorrow_hook)
         has_sub, sub_days = get_subscription_status(user_id)
@@ -2053,9 +2458,9 @@ async def process_single_story_job(job):
             asyncio.create_task(send_db_backup_to_admin(f"Создана {total_gen}-я сказка"))
 
         hook_teaser = f"\n🔮 В следующей серии: «{tomorrow_hook}»\n" if tomorrow_hook else "\n"
-        bal_line = f"👑 Безлимитная подписка активна ({sub_days} дн.)" if has_sub else f"🎁 Осталось сказок на балансе: {remaining} шт."
+        bal_line = f"👑 Безлимитная подписка активна ({sub_days} дн.)" if has_sub else f"🎁 Осталось авторских сказок: {remaining} шт."
         voice_caption = (
-            f"🎧 Аудиосказка для: {clean_name} (герой: {hero})"
+            f"🎧 Авторская сказка для: {clean_name} (герой: {hero})"
             f"{hook_teaser}"
             f"{bal_line}"
         )
@@ -2063,12 +2468,12 @@ async def process_single_story_job(job):
         await msg.answer_voice(
             voice=FSInputFile(audio_path),
             caption=voice_caption,
-            reply_markup=get_post_story_inline_kb()
+            reply_markup=get_post_story_inline_kb(is_classic=False)
         )
 
         if not has_sub and remaining <= 1 and tomorrow_hook:
             await msg.answer(
-                f"💡 На вашем балансе осталась {remaining} сказка.\n"
+                f"💡 На вашем балансе осталась {remaining} авторская сказка.\n"
                 f"Чтобы завтра малыш сразу узнал продолжение («{tomorrow_hook}»), выберите удобный пакет или подписку:",
                 reply_markup=get_tariffs_inline_kb()
             )
@@ -2104,7 +2509,7 @@ async def story_worker_loop(worker_id):
 # 11. ВЕБ-СЕРВЕР RENDER И СТАРТ
 # ==========================================
 async def handle_ping(request):
-    return web.Response(text="OK - FairyTale Audio Bot is running")
+    return web.Response(text="OK - Hybrid FairyTale Audio Bot is running")
 
 async def handle_telegram_webhook(request):
     secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
@@ -2134,8 +2539,9 @@ async def start_server():
 
 async def main():
     global story_task_queue
-    logging.info("ЗАПУСК АУДИО-СКАЗОЧНИКА...")
+    logging.info("ЗАПУСК ГИБРИДНОГО АУДИО-БОТА...")
     init_db()
+    load_all_classics(force=True)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(tts_thread_pool, synthesize_lullaby_loop_wav, LULLABY_WAV_PATH)
 
@@ -2146,15 +2552,15 @@ async def main():
         asyncio.create_task(story_worker_loop(i + 1))
         for i in range(NUM_QUEUE_WORKERS)
     ]
-    scheduler_task = asyncio.create_task(bedtime_reminder_scheduler())
 
     if ADMIN_ID != 0:
-        u_cnt, prof_cnt, s_cnt, _, _, _ = get_global_stats()
+        u_cnt, prof_cnt, s_cnt, _, _, classic_cached, _ = get_global_stats()
         try:
             await bot.send_message(
                 ADMIN_ID,
-                f"🚀 Аудио-бот запущен (без картинок, с предпрослушиванием дикторов и контролем ударений)!\n"
-                f"👥 Семей: {u_cnt} | 👶 Детей: {prof_cnt} | 📚 Сказок: {s_cnt}"
+                f"🚀 Гибридный аудио-бот запущен!\n"
+                f"👥 Семей: {u_cnt} | 👶 Детей: {prof_cnt} | 📚 Сказок: {s_cnt}\n"
+                f"🏛 Сказок в stories.json: {len(CLASSICS_CATALOG)} (в кэше: {classic_cached})"
             )
         except Exception:
             pass
@@ -2178,7 +2584,6 @@ async def main():
     finally:
         for t in worker_tasks:
             t.cancel()
-        scheduler_task.cancel()
         tts_thread_pool.shutdown(wait=False)
         if http_session and not http_session.closed:
             await http_session.close()

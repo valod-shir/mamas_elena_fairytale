@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import hmac
 import math
 import wave
 import time
@@ -18,7 +19,7 @@ from contextlib import contextmanager
 import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -46,7 +47,7 @@ logging.basicConfig(
 )
 
 # ==========================================
-# 1. КОНФИГУРАЦИЯ И НАСТРОЙКИ
+# 1. КОНФИГУРАЦИЯ И НАСТРОЙКИ БЕЗОПАСНОСТИ
 # ==========================================
 raw_token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("BOT_TOKEN") or ""
 BOT_TOKEN = raw_token.strip().strip("'\"")
@@ -57,6 +58,9 @@ if not BOT_TOKEN:
 
 raw_admin = os.environ.get("ADMIN_ID", "0").strip().strip("'\"")
 ADMIN_ID = int(raw_admin) if raw_admin.isdigit() else 0
+
+# Ссылка на ваш Telegram-канал (можно также задать командой /setchannel @юзернейм прямо в боте)
+DEFAULT_CHANNEL_URL = os.environ.get("CHANNEL_URL", "").strip()
 
 WEBHOOK_BASE_URL = (
     os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL") or ""
@@ -118,6 +122,11 @@ VOICE_PREVIEW_TEXTS = {
     )
 }
 
+PROMPT_INJECTION_PATTERNS = re.compile(
+    r'(ignore\s+previous|system\s+prompt|забудь\s+инструкц|игнорируй\s+правил|ты\s+больше\s+не)',
+    flags=re.IGNORECASE
+)
+
 def get_all_gemini_keys():
     keys = []
     candidates = [
@@ -146,6 +155,7 @@ def sanitize_input(text, max_len=70):
     if not text:
         return ""
     cleaned = re.sub(r'[<>{}\[\]\\*$#^~`|]', '', str(text))
+    cleaned = PROMPT_INJECTION_PATTERNS.sub('', cleaned)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     return cleaned[:max_len]
 
@@ -178,6 +188,19 @@ def safe_remove_files(*paths):
             except Exception:
                 pass
 
+def cleanup_stale_tmp_audio(max_age_sec=600):
+    """Очищает старые временные аудиофайлы в /tmp для защиты оперативной памяти Render."""
+    tmp_dir = "/tmp" if os.path.exists("/tmp") else "."
+    now = time.time()
+    try:
+        for fname in os.listdir(tmp_dir):
+            if fname.startswith(("story_", "sample_")) and fname.endswith((".ogg", ".mp3")):
+                fpath = os.path.join(tmp_dir, fname)
+                if now - os.path.getmtime(fpath) > max_age_sec:
+                    safe_remove_files(fpath)
+    except Exception:
+        pass
+
 async def safe_edit_text(message: Message, text: str, reply_markup=None):
     try:
         await message.edit_text(text, reply_markup=reply_markup)
@@ -197,6 +220,8 @@ async def safe_edit_text(message: Message, text: str, reply_markup=None):
 # 2. МОНИТОРИНГ ОШИБОК И RETRY
 # ==========================================
 async def report_error_to_admin(context_title, exc):
+    if isinstance(exc, TelegramForbiddenError):
+        return
     if isinstance(exc, TelegramBadRequest) and "message is not modified" in str(exc).lower():
         return
     tb_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
@@ -288,6 +313,12 @@ def init_db():
                 file_id TEXT
             )
         ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_val TEXT
+            )
+        ''')
 
         existing_cols = [
             row[1] for row in conn.execute("PRAGMA table_info(users);").fetchall()
@@ -330,6 +361,55 @@ def init_db():
                     (uid, l_child, l_hero, l_sum or "", t_hook or "", tot_gen or 1)
                 )
         conn.commit()
+
+def normalize_channel_info(raw_val: str):
+    """Возвращает кортеж (url, display_handle) для ссылки на канал."""
+    val = (raw_val or DEFAULT_CHANNEL_URL or "").strip()
+    if not val:
+        return "", ""
+    if val.startswith("@"):
+        clean = val[1:].strip()
+        return f"https://t.me/{clean}", f"@{clean}"
+    if "t.me/" in val:
+        slug = val.split("t.me/", 1)[1].strip("/").split("?")[0]
+        if slug and not slug.startswith("+"):
+            return f"https://t.me/{slug}", f"@{slug}"
+        return val, val
+    return f"https://t.me/{val}", f"@{val}"
+
+def get_channel_info():
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT setting_val FROM bot_settings WHERE setting_key = 'channel'"
+        ).fetchone()
+        saved = row[0] if row else ""
+    return normalize_channel_info(saved)
+
+def set_channel_info_db(raw_channel: str):
+    with get_db_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO bot_settings (setting_key, setting_val) VALUES ('channel', ?)",
+            (raw_channel.strip(),)
+        )
+        conn.commit()
+
+def validate_sqlite_file(file_path: str) -> bool:
+    """Проверяет, что загруженный файл действительно является целой базой SQLite 3."""
+    if not os.path.exists(file_path) or os.path.getsize(file_path) < 100:
+        return False
+    try:
+        with open(file_path, "rb") as f:
+            header = f.read(16)
+        if header != b"SQLite format 3\x00":
+            return False
+        conn = sqlite3.connect(file_path, timeout=5.0)
+        try:
+            res = conn.execute("PRAGMA quick_check;").fetchone()
+            return bool(res and res[0] == "ok")
+        finally:
+            conn.close()
+    except Exception:
+        return False
 
 def get_cached_voice_sample(voice_id, bg_music):
     key = f"{voice_id}::bg_{bg_music}"
@@ -571,6 +651,8 @@ async def send_db_backup_to_admin(reason="Плановый бэкап"):
     if ADMIN_ID == 0 or not os.path.exists(DB_PATH):
         return
     try:
+        with get_db_connection() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
         db_file = FSInputFile(DB_PATH, filename="users_backup.db")
         await bot.send_document(
             chat_id=ADMIN_ID,
@@ -994,14 +1076,16 @@ def get_donate_inline_kb():
     )
 
 def get_post_story_inline_kb():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Продолжить эту историю", callback_data="action_continue")],
-            [InlineKeyboardButton(text="🎲 Новая тема с этим же героем", callback_data="action_same_hero")],
-            [InlineKeyboardButton(text="👶 Сменить профиль ребёнка", callback_data="manage_children")],
-            [InlineKeyboardButton(text="⭐ Поблагодарить автора звёздами", callback_data="open_donate")]
-        ]
-    )
+    ch_url, _ = get_channel_info()
+    rows = [
+        [InlineKeyboardButton(text="🔄 Продолжить эту историю", callback_data="action_continue")],
+        [InlineKeyboardButton(text="🎲 Новая тема с этим же героем", callback_data="action_same_hero")],
+        [InlineKeyboardButton(text="👶 Сменить профиль ребёнка", callback_data="manage_children")],
+        [InlineKeyboardButton(text="⭐ Поблагодарить автора звёздами", callback_data="open_donate")]
+    ]
+    if ch_url:
+        rows.append([InlineKeyboardButton(text="📢 Наш уютный канал для родителей", url=ch_url)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def get_family_profiles_inline_kb(user_id):
     profiles = get_family_profiles(user_id)
@@ -1050,14 +1134,44 @@ async def start_command_handler(message: Message, state: FSMContext, command: Co
         utm_source = sanitize_input(command.args.strip(), max_len=40)
 
     register_or_get_user(user_id, utm_source)
+    _, ch_handle = get_channel_info()
+    channel_block = (
+        f"\n\n📢 Подписывайтесь на наш канал {ch_handle} — там мы обсуждаем детские ритуалы сна, "
+        f"делимся идеями для сказок и общаемся с родителями!"
+        if ch_handle else ""
+    )
 
     await message.answer(
-        "👋 Добро пожаловать в мир добрых персональных аудиосказок!\n\n"
-        "✨ Бот совершенно бесплатно сочиняет уютную сказку на ночь про вашего ребёнка "
-        "и его любимую игрушку и озвучивает её ласковым голосом под нежную мелодию музыкальной шкатулки.\n\n"
-        "🎙 В разделе «Голос и музыка» можно заранее прослушать и выбрать диктора.\n"
-        "🪄 Нажмите «Создать новую сказку», чтобы начать волшебство!",
+        f"👋 Добро пожаловать в мир добрых персональных аудиосказок!\n\n"
+        f"✨ Бот совершенно бесплатно сочиняет уютную сказку на ночь про вашего ребёнка "
+        f"и его любимую игрушку и озвучивает её ласковым голосом под нежную мелодию музыкальной шкатулки.\n\n"
+        f"🎙 В разделе «Голос и музыка» можно заранее прослушать и выбрать диктора.\n"
+        f"🪄 Нажмите «Создать новую сказку», чтобы начать волшебство!{channel_block}",
         reply_markup=main_menu_keyboard
+    )
+
+@dp.message(Command("setchannel"))
+async def set_channel_cmd(message: Message, state: FSMContext, command: CommandObject = None):
+    """Команда администратора для быстрой привязки канала прямо из чата Telegram."""
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    if not command or not command.args:
+        ch_url, ch_handle = get_channel_info()
+        cur = f"{ch_handle} ({ch_url})" if ch_url else "не задан"
+        await message.answer(
+            f"📢 Текущий канал: {cur}\n\n"
+            f"Чтобы привязать или изменить канал, отправьте:\n"
+            f"`/setchannel @юзернейм_канала`"
+        )
+        return
+
+    set_channel_info_db(command.args)
+    ch_url, ch_handle = get_channel_info()
+    await message.answer(
+        f"✅ Канал успешно привязан: {ch_handle}\n"
+        f"Ссылка: {ch_url}\n\n"
+        f"Теперь он отображается в приветствии `/start`, в профиле и кнопкой под каждой созданной сказкой!"
     )
 
 @dp.message(F.text == "👶 Профили детей")
@@ -1240,13 +1354,15 @@ async def admin_stats_cmd(message: Message, state: FSMContext):
     await state.clear()
     u_cnt, prof_cnt, s_cnt, p_cnt, stars_sum, utm_rows = get_global_stats()
     q_size = story_task_queue.qsize() if story_task_queue else 0
+    _, ch_handle = get_channel_info()
     utm_text = "\n".join([f"  • {src}: {cnt} чел." for src, cnt in utm_rows]) if utm_rows else "  Пока нет переходов по меткам"
     await message.answer(
         f"📊 Статистика бота:\n\n"
         f"📥 Задач в очереди: {q_size}\n"
         f"👥 Семей: {u_cnt} | 👶 Детей: {prof_cnt}\n"
         f"📚 Всего создано сказок: {s_cnt}\n"
-        f"⭐ Благодарностей от пользователей: {p_cnt} ({stars_sum} ⭐)\n\n"
+        f"⭐ Благодарностей от пользователей: {p_cnt} ({stars_sum} ⭐)\n"
+        f"📢 Привязанный канал: {ch_handle or 'не задан (/setchannel @канал)'}\n\n"
         f"📈 Источники трафика (UTM):\n{utm_text}"
     )
 
@@ -1269,9 +1385,12 @@ async def restore_db_from_file(message: Message, state: FSMContext):
     temp_restore = f"{DB_PATH}.restore"
     try:
         await bot.download(doc, destination=temp_restore)
+        if not validate_sqlite_file(temp_restore):
+            await message.answer("⚠️ Файл повреждён или не является корректной базой SQLite 3!")
+            return
         shutil.move(temp_restore, DB_PATH)
         init_db()
-        await message.answer("✅ База данных успешно восстановлена!")
+        await message.answer("✅ База данных проверена и успешно восстановлена!")
     except Exception as e:
         await message.answer(f"⚠️ Ошибка восстановления БД: {e}")
     finally:
@@ -1284,6 +1403,7 @@ async def show_profile(message: Message, state: FSMContext):
     total, last_child, last_hero, _, voice, _, bg_music = get_user_data(user_id)
     profiles = get_family_profiles(user_id)
     voice_name = AVAILABLE_VOICES.get(voice, AVAILABLE_VOICES[DEFAULT_VOICE])
+    ch_url, ch_handle = get_channel_info()
 
     if profiles:
         children_lines = "\n".join(
@@ -1294,21 +1414,22 @@ async def show_profile(message: Message, state: FSMContext):
         family_block = f"\n🧸 Активный герой: {last_hero} (для: {last_child})" if last_hero else ""
 
     bg_info = "Вкл (Музыкальная шкатулка)" if bg_music == 1 else "Выкл"
+    channel_line = f"\n\n📢 Наш канал о детском сне: {ch_handle}" if ch_handle else ""
 
-    profile_kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="👶 Управление профилями детей", callback_data="manage_children")],
-            [InlineKeyboardButton(text="⭐ Поблагодарить автора звёздами", callback_data="open_donate")]
-        ]
-    )
+    kb_rows = [
+        [InlineKeyboardButton(text="👶 Управление профилями детей", callback_data="manage_children")],
+        [InlineKeyboardButton(text="⭐ Поблагодарить автора звёздами", callback_data="open_donate")]
+    ]
+    if ch_url:
+        kb_rows.append([InlineKeyboardButton(text="📢 Перейти в наш канал", url=ch_url)])
 
     await message.answer(
         f"👤 Семейный профиль:\n\n"
         f"✨ Доступ к сказкам: Полный безлимит (Бесплатно)\n"
         f"📊 Всего создано сказок: {total} шт.{family_block}\n\n"
         f"🎙 Голос диктора: {voice_name}\n"
-        f"🎵 Колыбельная фоном: {bg_info}",
-        reply_markup=profile_kb
+        f"🎵 Колыбельная фоном: {bg_info}{channel_line}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows)
     )
 
 # ==========================================
@@ -1882,6 +2003,7 @@ async def process_single_story_job(job):
     audio_path = f"/tmp/story_{unique_tag}.ogg" if os.path.exists("/tmp") else f"story_{unique_tag}.ogg"
 
     try:
+        cleanup_stale_tmp_audio()
         _, _, _, _, preferred_voice, _, bg_music = get_user_data(user_id)
 
         async with ChatActionSender.typing(bot=bot, chat_id=msg.chat.id):
@@ -1915,13 +2037,18 @@ async def process_single_story_job(job):
 
         await msg.answer("Главное меню:", reply_markup=main_menu_keyboard)
 
+    except TelegramForbiddenError:
+        logging.info(f"Пользователь {user_id} заблокировал бота во время генерации.")
     except Exception as e:
         await report_error_to_admin("Story Worker Error", e)
-        await msg.answer(
-            "⚠️ Не удалось завершить создание аудиосказки из-за временной перегрузки сервера. "
-            "Пожалуйста, нажмите кнопку ещё раз через пару секунд!",
-            reply_markup=main_menu_keyboard
-        )
+        try:
+            await msg.answer(
+                "⚠️ Не удалось завершить создание аудиосказки из-за временной перегрузки сервера. "
+                "Пожалуйста, нажмите кнопку ещё раз через пару секунд!",
+                reply_markup=main_menu_keyboard
+            )
+        except Exception:
+            pass
     finally:
         active_generations.discard(user_id)
         safe_remove_files(audio_path)
@@ -1945,7 +2072,7 @@ async def handle_ping(request):
 
 async def handle_telegram_webhook(request):
     secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if secret_header != WEBHOOK_SECRET:
+    if not hmac.compare_digest(secret_header, WEBHOOK_SECRET):
         return web.Response(status=403, text="Forbidden")
     try:
         data = await request.json()
@@ -1958,7 +2085,7 @@ async def handle_telegram_webhook(request):
     return web.Response(text="OK")
 
 async def start_server():
-    app = web.Application()
+    app = web.Application(client_max_size=2 * 1024 * 1024)
     app.router.add_get('/', handle_ping)
     app.router.add_get('/health', handle_ping)
     app.router.add_post(WEBHOOK_PATH, handle_telegram_webhook)
@@ -1975,6 +2102,7 @@ async def main():
     global story_task_queue
     logging.info("ЗАПУСК БЕСПЛАТНОГО АУДИО-СКАЗОЧНИКА...")
     init_db()
+    cleanup_stale_tmp_audio(max_age_sec=0)
     synthesize_lullaby_loop_wav(LULLABY_WAV_PATH)
 
     story_task_queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
@@ -1987,12 +2115,14 @@ async def main():
 
     if ADMIN_ID != 0:
         u_cnt, prof_cnt, s_cnt, p_cnt, stars_sum, _ = get_global_stats()
+        _, ch_handle = get_channel_info()
         try:
             await bot.send_message(
                 ADMIN_ID,
                 f"🚀 Бесплатный аудио-бот запущен!\n"
                 f"👥 Семей: {u_cnt} | 👶 Детей: {prof_cnt} | 📚 Сказок: {s_cnt}\n"
-                f"⭐ Собрано благодарностей: {p_cnt} ({stars_sum} ⭐)"
+                f"⭐ Собрано благодарностей: {p_cnt} ({stars_sum} ⭐)\n"
+                f"📢 Канал: {ch_handle or 'не задан (укажите через /setchannel @канал)'}"
             )
         except Exception:
             pass
